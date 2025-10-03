@@ -1,0 +1,16 @@
+# ModelFinder Core Dependencies - Phase 1
+# Minimal, safe dependencies for basic 3D model indexing and search
+
+# === Core runtime for Phase 1 (indexing + search CLIs) ===
+numpy
+faiss-cpu
+trimesh
+pygltflib
+pillow
+tqdm
+pyrender
+PyOpenGL
+
+# Utilities (logging + nicer CLI)
+loguru
+click

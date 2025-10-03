@@ -1,0 +1,11 @@
+# Placeholder for app.ico
+
+This file should be replaced with a proper 256x256 multi-size ICO file for the application icon.
+
+To create an app.ico file:
+1. Create a 256x256 PNG image with your desired icon
+2. Use an online ICO converter or tool like ImageMagick to convert it to ICO format
+3. Replace this placeholder file with the actual app.ico
+
+For now, the build will work without an icon, but you'll get a warning.
+

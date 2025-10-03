@@ -1,0 +1,8 @@
+# ModelFinder UI Dependencies - Phase 2+
+# GUI and desktop interface dependencies
+
+# === Desktop UI (install when building the PyQt viewer) ===
+PyQt6
+# Optional helpers:
+# qtawesome
+# qdarkstyle
