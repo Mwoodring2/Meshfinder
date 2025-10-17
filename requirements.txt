@@ -1,1 +1,9 @@
 ﻿PySide6>=6.6
+numpy
+trimesh
+PyOpenGL
+PyOpenGL-accelerate
+pandas
+openpyxl
+scikit-learn>=1.0
+joblib

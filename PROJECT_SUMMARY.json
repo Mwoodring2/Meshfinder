@@ -1,0 +1,295 @@
+{
+  "project": {
+    "name": "ModelFinder",
+    "alternate_names": ["Meshfinder", "Re-topo AI Retopology Studio"],
+    "version": "2.0 Enhanced UI",
+    "type": "Desktop Application",
+    "platform": "Windows",
+    "status": "Active Development"
+  },
+  
+  "description": {
+    "tagline": "Professional 3D Asset Management and Organization Tool",
+    "purpose": "Advanced 3D model file indexer, organizer, and viewer with AI-powered naming proposals and similarity search",
+    "target_users": "3D artists, VFX studios, game developers, asset managers",
+    "key_capabilities": [
+      "Fast multi-drive scanning and indexing of 3D assets (.obj, .fbx, .stl, .ma, .mb)",
+      "Advanced filtering by file type, size, triangle count, project metadata",
+      "AI-powered name proposal system using reference parts from Excel",
+      "TF-IDF + FAISS similarity search for finding related assets",
+      "3D mesh preview with PyOpenGL (Blender-style navigation)",
+      "Batch tagging and metadata management",
+      "Excel import for project reference parts",
+      "Professional dark/light themed UI"
+    ]
+  },
+
+  "technology_stack": {
+    "language": "Python 3.10+",
+    "ui_framework": "PySide6 (Qt for Python)",
+    "database": "SQLite3",
+    "3d_rendering": "PyOpenGL 3.0+",
+    "3d_processing": "trimesh (optional)",
+    "ml_libraries": {
+      "similarity_search": ["numpy", "faiss-cpu", "scikit-learn", "joblib"],
+      "data_processing": ["pandas", "openpyxl"]
+    },
+    "build_tools": ["PyInstaller (for .exe generation)", "Inno Setup (for installer)"]
+  },
+
+  "architecture": {
+    "pattern": "MVC with Qt Model-View architecture",
+    "main_components": {
+      "main_enhanced.py": "Primary application entry point with 3-panel UI",
+      "src/ui/": "UI components (gl_viewer, review_panel, workers)",
+      "src/dataio/": "Database operations (db.py, reference_parts.py)",
+      "src/features/": "Business logic (propose system, migration)",
+      "src/ml/": "Machine learning features (type_classifier, project_extractor)",
+      "src/utils/": "Utilities (config, logger, naming, normalize)"
+    },
+    "database_schema": {
+      "files": "Main table storing 3D asset metadata (path, name, ext, size, mtime, tags, geometry, proposals)",
+      "project_reference_parts": "Reference parts imported from Excel for name proposals"
+    },
+    "ui_layout": "3-panel: Filters (left) | Table + Toolbar (center) | Preview/Details (right)"
+  },
+
+  "key_features": {
+    "indexing": {
+      "description": "Background scanning of directories/drives for 3D files",
+      "worker": "Indexer QThread",
+      "supported_formats": [".obj", ".fbx", ".stl", ".ma", ".mb"],
+      "exclusions": ["windows\\winsxs", "$recycle.bin", "system volume information"]
+    },
+    "filtering": {
+      "filter_types": ["File type", "Project number", "Part name", "File size (MB)", "Triangle count"],
+      "search": "Real-time text search on name and tags"
+    },
+    "similarity_search": {
+      "algorithm": "TF-IDF vectorization + FAISS inner product (cosine similarity)",
+      "index_features": "File names + tags",
+      "use_case": "Find similar assets based on naming patterns"
+    },
+    "proposal_system": {
+      "description": "AI-powered name suggestions based on reference parts",
+      "input": "Excel files with project part lists",
+      "matching": "Fuzzy matching against reference part database",
+      "confidence_threshold": "0.66 (configurable)",
+      "workflow": "Import Excel → Propose Names → Review → Accept/Edit"
+    },
+    "3d_viewer": {
+      "description": "OpenGL-based mesh viewer",
+      "navigation": "Blender-style (middle-mouse orbit, scroll zoom, shift-middle pan)",
+      "constraints": "GUI thread only (no worker contexts)",
+      "features": ["Wireframe toggle", "Auto-framing (F key)", "Dynamic clipping"]
+    },
+    "batch_operations": {
+      "batch_tagging": "Multi-select files with Ctrl+click, apply tags to all",
+      "geometry_computation": "Compute triangle counts and dimensions in background",
+      "csv_export": "Export filtered results with customizable columns"
+    }
+  },
+
+  "file_structure": {
+    "root": "E:\\File storage for 3d printing\\woodring_print_files\\Meshfinder\\",
+    "main_files": [
+      "main_enhanced.py (3030 lines) - Primary application",
+      "main.py - Legacy/alternative entry point"
+    ],
+    "source_directories": {
+      "src/ui/": ["gl_viewer.py", "review_helpers.py", "review_panel.py", "review_table_model.py", "workers.py"],
+      "src/dataio/": ["db.py", "reference_parts.py"],
+      "src/features/": ["propose.py", "propose_enhanced.py", "propose_from_reference.py", "migrate.py"],
+      "src/ml/": ["type_classifier.py", "project_extractor.py"],
+      "src/utils/": ["config.py", "database.py", "logger.py", "naming.py", "normalize.py"],
+      "src/indexer/": ["modelfinder_indexer.py"]
+    },
+    "data_directories": {
+      "data/db/": "Database files (meshfinder.sqlite, modelfinder.db)",
+      "db/": "FAISS indexes and ML artifacts",
+      "logs/": "Application logs",
+      "data/posters/": "Poster images (23 PNG files)"
+    },
+    "scripts/": "Utility scripts for building, testing, importing, scanning",
+    "docs/": "Documentation files (.md)",
+    "build/": "PyInstaller build output",
+    "dist/": "Distribution files",
+    "installer/": "Inno Setup configuration"
+  },
+
+  "database_details": {
+    "location": "%APPDATA%\\ModelFinder\\index.db (default)",
+    "tables": {
+      "files": {
+        "columns": [
+          "id (PRIMARY KEY)",
+          "path (UNIQUE)",
+          "name, ext, size, mtime",
+          "tags (user-editable)",
+          "tris, dim_x, dim_y, dim_z, volume, watertight (geometry)",
+          "project_number, project_name, part_name, proposed_name (proposals)",
+          "type_conf, project_conf (ML confidence scores)",
+          "sha256, status"
+        ],
+        "indexes": ["idx_name", "idx_ext"]
+      },
+      "project_reference_parts": {
+        "columns": [
+          "id (PRIMARY KEY)",
+          "project_number, project_name, part_name",
+          "original_label, description, quantity",
+          "UNIQUE(project_number, project_name, part_name)"
+        ]
+      }
+    }
+  },
+
+  "ui_design": {
+    "theme": "Professional dark theme (default) with light theme toggle",
+    "color_scheme_dark": {
+      "background": "#2b2b2b",
+      "panels": "#3c3c3c",
+      "toolbar": "#404040",
+      "accent": "#0078d4",
+      "borders": "#666666"
+    },
+    "panels": {
+      "left": "Filters panel (200-250px) - File type, project, size, triangle filters",
+      "center": "Main content - Toolbar + Results table with 12 columns",
+      "right": "Preview panel (250-320px) - Thumbnail, metadata, quick actions"
+    },
+    "table_columns": [
+      "Name", "Extension", "Size (MB)", "Modified", "Tags",
+      "Path", "Project #", "Project Name", "Part Name",
+      "Proposed Name", "Conf.", "Needs Review"
+    ],
+    "shortcuts": {
+      "Ctrl+F": "Find", "Ctrl+T": "Batch Tag", "Ctrl+E": "Export CSV",
+      "Ctrl+I": "Import Excel", "Ctrl+P": "Propose Names",
+      "Ctrl+G": "Compute Geometry", "Ctrl+B": "Build Similarity Index",
+      "Ctrl+Shift+T": "Toggle Theme", "F5": "Refresh", "F11": "Fullscreen"
+    }
+  },
+
+  "dependencies": {
+    "core": [
+      "PySide6 (Qt6 for Python)",
+      "sqlite3 (built-in)"
+    ],
+    "optional_features": {
+      "3d_processing": ["trimesh (geometry computation, thumbnail generation)"],
+      "similarity_search": ["numpy", "faiss-cpu", "scikit-learn", "joblib"],
+      "excel_import": ["pandas", "openpyxl"],
+      "thumbnails": ["PIL/Pillow"]
+    },
+    "requirements_files": [
+      "requirements.txt (all dependencies)",
+      "requirements-core.txt (UI only)",
+      "requirements-ml.txt (ML features)",
+      "requirements-ui.txt (UI + basic features)"
+    ]
+  },
+
+  "recent_work": {
+    "completed": [
+      "Fixed type checker warnings for optional sklearn imports (added # type: ignore comments)",
+      "Implemented 3-panel enhanced UI with dark/light themes",
+      "Added batch tagging with multi-select support",
+      "Integrated Excel import for project reference parts",
+      "Implemented proposal system with confidence scoring",
+      "Added similarity search using TF-IDF + FAISS",
+      "Created professional menu bar with keyboard shortcuts",
+      "Implemented thumbnail caching system"
+    ],
+    "current_status": {
+      "git_changes": [
+        "Modified: main.py, requirements.txt, db/tfidf_vectorizer.joblib",
+        "New files: main_enhanced.py, src/ modules, docs/, data/, scripts/"
+      ],
+      "build_ready": "Yes - build.bat and installer.iss configured"
+    }
+  },
+
+  "development_mode": {
+    "forge_mode": "ENABLED",
+    "principles": [
+      "Maximum capability - proactive, decisive, no permission-seeking",
+      "Comprehensive solutions - implement fully, don't just suggest",
+      "Strategic planning - break down complex tasks systematically",
+      "Persistent execution - continue until complete using full context windows",
+      "Thorough verification - test and validate all changes"
+    ],
+    "coding_standards": [
+      "Python 3.10+",
+      "Type hints where appropriate",
+      "Comprehensive error handling with try-except",
+      "Git-style diffs for changes",
+      "Thread-safe operations for background workers",
+      "GL operations on main thread only"
+    ]
+  },
+
+  "usage_workflow": {
+    "typical_session": [
+      "1. Launch ModelFinder (main_enhanced.py)",
+      "2. Scan folders or entire drives to index 3D assets",
+      "3. (Optional) Import Excel with project reference parts",
+      "4. Filter and search for specific assets",
+      "5. Apply batch tags to organize files",
+      "6. (Optional) Generate name proposals for projects",
+      "7. Preview 3D models and metadata",
+      "8. Export results to CSV",
+      "9. (Optional) Build similarity index for advanced search"
+    ]
+  },
+
+  "known_constraints": {
+    "platform": "Windows-specific (uses os.startfile, ctypes.windll)",
+    "opengl": "Must run on GUI thread (no worker contexts)",
+    "navigation": "Blender-only style (middle-mouse required)",
+    "single_mesh": "Viewer handles single mesh per load",
+    "optional_deps": "Many features require optional packages (gracefully degrade if missing)"
+  },
+
+  "testing": {
+    "test_files": ["test_cube.stl", "test_cylinder.stl", "test_sphere.stl"],
+    "test_scenarios": [
+      "Tiny STL load",
+      "Large OBJ load",
+      "Wireframe toggle",
+      "F key refit",
+      "Batch tag multi-select",
+      "Excel import with various formats"
+    ]
+  },
+
+  "documentation": {
+    "available_docs": [
+      "3D_VIEWER_IMPLEMENTATION.md",
+      "docs/3D_VIEWER_GUIDE.md",
+      "docs/architecture.md",
+      "docs/MAINWINDOW_PROPOSE_INTEGRATION.md",
+      "docs/REFERENCE_PARTS_INTEGRATION.md",
+      "docs/roadmap.md",
+      "docs/setup_guide.md",
+      "docs/SYSTEM_BEHAVIOR_AND_ENHANCEMENTS.md",
+      "docs/TABLE_COLUMNS_GUIDE.md",
+      "docs/UI_REVIEW_INTEGRATION.md",
+      "INTEGRATION_COMPLETE.md",
+      "INTEGRATION_TODO.md",
+      "QUICK_START.md",
+      "README.md",
+      "STARTER_PACK_STATUS.md",
+      "STRESS_TEST_RESULTS.md"
+    ]
+  },
+
+  "contact_context": {
+    "development_environment": "Cursor IDE with AI assistance (Claude Sonnet 4.5)",
+    "workspace": "E:\\File storage for 3d printing\\woodring_print_files\\Meshfinder",
+    "shell": "PowerShell (Windows)",
+    "python_version": "3.10+",
+    "primary_file": "main_enhanced.py (3030 lines)"
+  }
+}
+

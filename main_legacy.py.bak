@@ -47,6 +47,17 @@ try:
 except Exception:
     _SIM_AVAILABLE = False
 
+# --- NEW: Proposal system imports ---
+try:
+    from src.features.propose_from_reference import propose_for_rows, RowMeta
+    from src.ui.workers import ProposeWorker
+    from src.dataio.db import update_proposal, batch_update_proposals
+    from src.dataio.reference_parts import load_reference_parts, get_all_projects
+    _PROPOSAL_AVAILABLE = True
+except Exception as e:
+    _PROPOSAL_AVAILABLE = False
+    print(f"Warning: Proposal system not available: {e}")
+
 APP_NAME = "ModelFinder"
 DB_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".model_finder"))) / APP_NAME
 DB_PATH = DB_DIR / "index.db"
@@ -85,12 +96,49 @@ def ensure_db():
         "ALTER TABLE files ADD COLUMN dim_y REAL",
         "ALTER TABLE files ADD COLUMN dim_z REAL",
         "ALTER TABLE files ADD COLUMN volume REAL",
-        "ALTER TABLE files ADD COLUMN watertight INTEGER"
+        "ALTER TABLE files ADD COLUMN watertight INTEGER",
+        # --- NEW: Proposal system columns ---
+        "ALTER TABLE files ADD COLUMN project_number TEXT",
+        "ALTER TABLE files ADD COLUMN project_name TEXT",
+        "ALTER TABLE files ADD COLUMN part_name TEXT",
+        "ALTER TABLE files ADD COLUMN type_conf REAL",
+        "ALTER TABLE files ADD COLUMN project_conf REAL",
+        "ALTER TABLE files ADD COLUMN sha256 TEXT",
+        "ALTER TABLE files ADD COLUMN status TEXT"
     ]:
         try:
             cur.execute(ddl)
         except Exception:
             pass
+    
+    # --- NEW: Operations log table ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ops_log(
+            id INTEGER PRIMARY KEY,
+            op TEXT,               -- scan|propose|rename|move|rollback
+            before_path TEXT,
+            after_path  TEXT,
+            sha256 TEXT,
+            user TEXT,
+            detail_json TEXT,
+            ts_utc TEXT
+        )
+    """)
+    
+    # --- NEW: Reference parts table ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS project_reference_parts(
+            id INTEGER PRIMARY KEY,
+            project_number TEXT,
+            project_name TEXT,
+            part_name TEXT,
+            original_label TEXT,
+            description TEXT,
+            quantity INTEGER DEFAULT 1,
+            UNIQUE(project_number, project_name, part_name) ON CONFLICT IGNORE
+        )
+    """)
+    
     con.commit()
     con.close()
 
@@ -441,6 +489,62 @@ class FileTableModel(QtCore.QAbstractTableModel):
         return row[0], row[1], row[2], row[3], row[4], row[5]
 
 
+class ExcelImportDialog(QtWidgets.QDialog):
+    """Dialog for configuring Excel import options"""
+    
+    def __init__(self, parent, file_path):
+        super().__init__(parent)
+        self.setWindowTitle("Import Excel - Project Parts")
+        self.setModal(True)
+        self.resize(400, 300)
+        
+        layout = QtWidgets.QVBoxLayout(self)
+        
+        # File info
+        info_label = QtWidgets.QLabel(f"File: {Path(file_path).name}")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Options
+        options_group = QtWidgets.QGroupBox("Import Options")
+        options_layout = QtWidgets.QFormLayout(options_group)
+        
+        # Import to database checkbox
+        self.import_to_db = QtWidgets.QCheckBox("Import directly to database")
+        self.import_to_db.setChecked(True)
+        self.import_to_db.setToolTip("Add parts to ModelFinder database for auto-suggestions")
+        options_layout.addRow(self.import_to_db)
+        
+        # Project number override
+        self.project_num_edit = QtWidgets.QLineEdit()
+        self.project_num_edit.setPlaceholderText("Auto-detect from filename")
+        options_layout.addRow("Project Number:", self.project_num_edit)
+        
+        # Project name override
+        self.project_name_edit = QtWidgets.QLineEdit()
+        self.project_name_edit.setPlaceholderText("Auto-detect from filename")
+        options_layout.addRow("Project Name:", self.project_name_edit)
+        
+        layout.addWidget(options_group)
+        
+        # Buttons
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | 
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+    
+    def get_options(self):
+        """Return import options as dict"""
+        return {
+            'import_to_db': self.import_to_db.isChecked(),
+            'project_number': self.project_num_edit.text().strip() or None,
+            'project_name': self.project_name_edit.text().strip() or None
+        }
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -448,15 +552,151 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1100, 700)
         self.settings = QtCore.QSettings("ModelFinder", "ModelFinder")
         self.indexer: Indexer | None = None
+        self.threadpool = QtCore.QThreadPool.globalInstance()  # NEW: For background workers
+        self.current_scan_roots: list[Path] = []  # Track current scan context
+        self.show_all_files = False  # Toggle between current scan vs all files
         self._build_ui()
         ensure_db()
-        self.refresh_table()
+        # Start with empty table - data will be loaded when folders are scanned
+        self.model.set_rows([])
+
+    def apply_dark_theme(self):
+        """Apply professional dark theme similar to Torrblar"""
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QToolBar {
+                background-color: #404040;
+                border: none;
+                spacing: 3px;
+                padding: 2px;
+            }
+            QToolButton {
+                background-color: #505050;
+                border: 1px solid #666666;
+                border-radius: 3px;
+                padding: 4px 8px;
+                color: #ffffff;
+            }
+            QToolButton:hover {
+                background-color: #606060;
+                border-color: #777777;
+            }
+            QToolButton:pressed {
+                background-color: #404040;
+            }
+            QToolButton:checked {
+                background-color: #0078d4;
+                border-color: #106ebe;
+            }
+            QLineEdit, QComboBox {
+                background-color: #3c3c3c;
+                border: 1px solid #666666;
+                border-radius: 3px;
+                padding: 4px;
+                color: #ffffff;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border-color: #0078d4;
+            }
+            QTableView {
+                background-color: #3c3c3c;
+                alternate-background-color: #404040;
+                gridline-color: #555555;
+                color: #ffffff;
+                border: 1px solid #666666;
+            }
+            QTableView::item {
+                padding: 4px;
+                border: none;
+            }
+            QTableView::item:selected {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            QTableView::item:hover {
+                background-color: #505050;
+            }
+            QHeaderView::section {
+                background-color: #404040;
+                border: 1px solid #666666;
+                padding: 4px;
+                color: #ffffff;
+            }
+            QStatusBar {
+                background-color: #404040;
+                color: #ffffff;
+                border-top: 1px solid #666666;
+            }
+            QGroupBox {
+                background-color: #3c3c3c;
+                border: 1px solid #666666;
+                border-radius: 3px;
+                margin-top: 10px;
+                color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+            QCheckBox {
+                color: #ffffff;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QCheckBox::indicator:unchecked {
+                border: 1px solid #666666;
+                background-color: #3c3c3c;
+            }
+            QCheckBox::indicator:checked {
+                border: 1px solid #0078d4;
+                background-color: #0078d4;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+        """)
 
     def _build_ui(self):
-        # Toolbar with search
-        toolbar = QtWidgets.QToolBar()
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+        # Apply dark theme first
+        self.apply_dark_theme()
+        
+        # Create main layout with 3 panels
+        main_widget = QtWidgets.QWidget()
+        self.setCentralWidget(main_widget)
+        
+        # Main horizontal layout
+        main_layout = QtWidgets.QHBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # Left panel - Filters
+        self._build_filters_panel()
+        main_layout.addWidget(self.filters_panel)
+        
+        # Center panel - Main content
+        center_widget = QtWidgets.QWidget()
+        center_layout = QtWidgets.QVBoxLayout(center_widget)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Top toolbar
+        self._build_toolbar()
+        center_layout.addWidget(self.toolbar)
+        
+        # Results table
+        self._build_results_table()
+        center_layout.addWidget(self.results_widget)
+        
+        main_layout.addWidget(center_widget)
+        
+        # Right panel - Metadata/Preview
+        self._build_preview_panel()
+        main_layout.addWidget(self.preview_panel)
 
         # Geometry compute (Phase 2)
         self.btn_compute_geo = QtWidgets.QToolButton()
@@ -491,6 +731,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_build_sim.clicked.connect(self._rebuild_similarity_index)
         toolbar.addWidget(self.btn_build_sim)
 
+        # NEW: Propose Names button
+        if _PROPOSAL_AVAILABLE:
+            self.btn_propose = QtWidgets.QToolButton()
+            self.btn_propose.setText("🎯 Propose Names")
+            self.btn_propose.setToolTip("Generate name proposals using reference parts")
+            self.btn_propose.clicked.connect(self.on_propose_names_clicked)
+            toolbar.addWidget(self.btn_propose)
+
         self.search_edit = QtWidgets.QLineEdit()
         self.search_edit.setPlaceholderText("Search by name or tags…")
         self.search_edit.returnPressed.connect(self.refresh_table)
@@ -512,6 +760,21 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_scan_all.setText("Scan All Drives")
         btn_scan_all.clicked.connect(self.scan_all_drives)
         toolbar.addWidget(btn_scan_all)
+
+        # Toggle between current scan and all files
+        self.btn_show_all = QtWidgets.QToolButton()
+        self.btn_show_all.setText("Show All Files")
+        self.btn_show_all.setCheckable(True)
+        self.btn_show_all.setToolTip("Toggle between showing current scan results vs all files in database")
+        self.btn_show_all.clicked.connect(self.toggle_show_all_files)
+        toolbar.addWidget(self.btn_show_all)
+
+        # Excel import button
+        self.btn_import_excel = QtWidgets.QToolButton()
+        self.btn_import_excel.setText("📊 Import Excel")
+        self.btn_import_excel.setToolTip("Import Excel files with project part labels for training")
+        self.btn_import_excel.clicked.connect(self.import_excel_dialog)
+        toolbar.addWidget(self.btn_import_excel)
 
         # Central table
         self.table = QtWidgets.QTableView()
@@ -539,6 +802,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Status bar
         self.status = QtWidgets.QStatusBar()
         self.setStatusBar(self.status)
+        self.status.showMessage("Ready - Click 'Scan Folders...' to index 3D assets")
 
         # Layout
         # --- Preview Pane (below the table) ---
@@ -594,16 +858,138 @@ class MainWindow(QtWidgets.QMainWindow):
         if ret == QtWidgets.QMessageBox.StandardButton.Yes:
             self.start_indexing(drives)
 
+    def toggle_show_all_files(self):
+        """Toggle between showing current scan results vs all files in database"""
+        self.show_all_files = self.btn_show_all.isChecked()
+        if self.show_all_files:
+            self.btn_show_all.setText("Show Current Scan")
+            self.status.showMessage("Showing all files in database", 3000)
+        else:
+            self.btn_show_all.setText("Show All Files")
+            self.status.showMessage("Showing current scan results only", 3000)
+        self.refresh_table()
+
+    def clear_database(self):
+        """Clear all files from the database"""
+        try:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("DELETE FROM files")
+            con.commit()
+            con.close()
+            self.status.showMessage("Database cleared", 3000)
+            print("DEBUG: Database cleared")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, f"Failed to clear database: {e}")
+
+    def import_excel_dialog(self):
+        """Open dialog to import Excel files with project part labels"""
+        try:
+            # Check if pandas is available
+            import pandas as pd
+            import openpyxl
+        except ImportError:
+            QtWidgets.QMessageBox.warning(
+                self, APP_NAME,
+                "Excel import requires pandas and openpyxl.\n\n"
+                "Please install them:\n"
+                "pip install pandas openpyxl"
+            )
+            return
+        
+        # File dialog to select Excel file
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Excel File with Project Parts",
+            str(Path.home()),
+            "Excel Files (*.xlsx *.xls);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+        
+        # Ask for import options
+        dialog = ExcelImportDialog(self, file_path)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.run_excel_import(file_path, dialog.get_options())
+
+    def run_excel_import(self, file_path, options):
+        """Run the Excel import process"""
+        try:
+            # Import the Excel import function
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).parent))
+            from scripts.import_label_excel_to_modelfinder import import_excel_file, upsert_to_db
+            
+            self.status.showMessage("Importing Excel file...")
+            
+            # Import Excel data
+            parts, project_info = import_excel_file(file_path)
+            
+            if not parts:
+                QtWidgets.QMessageBox.warning(self, APP_NAME, "No parts found in Excel file.")
+                return
+            
+            # Override project info if provided
+            if options['project_number']:
+                project_info['project_number'] = options['project_number']
+            if options['project_name']:
+                project_info['project_name'] = options['project_name']
+            
+            # Import to database if requested
+            if options['import_to_db']:
+                db_path = str(DB_PATH)
+                upsert_to_db(parts, project_info, db_path, "project_reference_parts")
+                
+                QtWidgets.QMessageBox.information(
+                    self, APP_NAME,
+                    f"Successfully imported {len(parts)} parts from {Path(file_path).name}\n\n"
+                    f"Project: {project_info['project_number']} - {project_info['project_name']}\n"
+                    f"Database: {db_path}"
+                )
+            else:
+                QtWidgets.QMessageBox.information(
+                    self, APP_NAME,
+                    f"Found {len(parts)} parts in {Path(file_path).name}\n\n"
+                    f"Project: {project_info['project_number']} - {project_info['project_name']}"
+                )
+            
+            self.status.showMessage(f"Imported {len(parts)} parts from {Path(file_path).name}", 5000)
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, APP_NAME,
+                f"Excel import failed:\n{e}"
+            )
+            self.status.clearMessage()
+
     def start_indexing(self, roots: list[Path]):
         if self.indexer and self.indexer.isRunning():
             QtWidgets.QMessageBox.information(self, APP_NAME, "Indexing is already running.")
             return
+        
+        # Ask user if they want to clear existing data
+        if self.current_scan_roots:  # Only ask if there's existing data
+            ret = QtWidgets.QMessageBox.question(
+                self, APP_NAME,
+                "Clear existing database and start fresh?\n\n"
+                "Yes = Clear all data, show only new scan\n"
+                "No = Keep existing data, add new files",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+            )
+            if ret == QtWidgets.QMessageBox.StandardButton.Yes:
+                self.clear_database()
+        
         excludes = ["windows\\winsxs", "$recycle.bin", "system volume information"]
         self.indexer = Indexer(roots, excludes)
         self.indexer.progress.connect(self.on_progress)
         self.indexer.indexed.connect(self.on_indexed)
         self.indexer.finished_ok.connect(self.on_index_finish)
         self.indexer.error.connect(self.on_index_error)
+        # Store current scan roots for filtering
+        self.current_scan_roots = roots
+        print(f"DEBUG: Starting scan of {len(roots)} folders: {[str(r) for r in roots]}")
         self.status.showMessage("Indexing…")
         self.indexer.start()
 
@@ -616,6 +1002,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_index_finish(self):
         self.status.showMessage("Indexing complete", 5000)
+        print(f"DEBUG: Indexing finished, refreshing table with {len(self.current_scan_roots)} scan roots")
         self.refresh_table()
 
     def on_index_error(self, msg: str):
@@ -627,6 +1014,21 @@ class MainWindow(QtWidgets.QMainWindow):
         chosen = self.ext_filter.currentText()
         exts = None if chosen == "All" else {chosen}
         rows = query_files(term, exts)
+        
+        # Filter by current scan roots if available and not showing all files
+        if self.current_scan_roots and not self.show_all_files:
+            filtered_rows = []
+            for row in rows:
+                file_path_str = row[0]  # row[0] = path
+                # Simple string-based filtering (more reliable than Path.resolve)
+                for root in self.current_scan_roots:
+                    root_str = str(root)
+                    if file_path_str.startswith(root_str):
+                        filtered_rows.append(row)
+                        break
+            rows = filtered_rows
+            print(f"DEBUG: Filtered to {len(rows)} files from {len(self.current_scan_roots)} scan roots")
+        
         # Phase 1: apply optional path filter (substring match, case-insensitive)
         pf = self.path_filter.text().strip()
         if pf:
@@ -1185,6 +1587,170 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_sim_err(self, msg: str):
         QtWidgets.QMessageBox.critical(self, APP_NAME, f"Similarity rebuild failed: {msg}")
         self.btn_build_sim.setEnabled(True)
+
+    # ============================================================================
+    # NEW: Proposal System Methods
+    # ============================================================================
+
+    def _selected_rows_to_meta(self) -> list:
+        """Convert selected table rows to RowMeta objects for proposal generation."""
+        if not _PROPOSAL_AVAILABLE:
+            return []
+        
+        metas = []
+        selected = self.table.selectionModel().selectedRows()
+        
+        if not selected:
+            # If nothing selected, use all visible rows
+            for row_idx in range(self.model.rowCount()):
+                row = self.model.rows[row_idx]
+                metas.append(RowMeta(
+                    path=row[0],
+                    name=row[1],
+                    ext=row[2],
+                    tags=row[5] if len(row) > 5 else ""
+                ))
+        else:
+            # Use only selected rows
+            for idx in selected:
+                row = self.model.rows[idx.row()]
+                metas.append(RowMeta(
+                    path=row[0],
+                    name=row[1],
+                    ext=row[2],
+                    tags=row[5] if len(row) > 5 else ""
+                ))
+        
+        return metas
+
+    def on_propose_names_clicked(self):
+        """Handle Propose Names button click."""
+        if not _PROPOSAL_AVAILABLE:
+            QtWidgets.QMessageBox.warning(
+                self, APP_NAME,
+                "Proposal system not available. Check imports."
+            )
+            return
+        
+        # Ask for project number
+        project_number, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Project Number",
+            "Enter project number (e.g., 300868):\n\n"
+            "This will match files against reference parts for this project.",
+            QtWidgets.QLineEdit.EchoMode.Normal,
+            ""
+        )
+        
+        if not ok or not project_number.strip():
+            return
+        
+        # Get rows to process
+        rows = self._selected_rows_to_meta()
+        
+        if not rows:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Propose Names",
+                "No files to process. Please scan folders first."
+            )
+            return
+        
+        # Check if reference parts exist
+        try:
+            project_name, parts_map = load_reference_parts(
+                str(DB_PATH),
+                project_number.strip()
+            )
+            
+            if not parts_map:
+                ret = QtWidgets.QMessageBox.question(
+                    self,
+                    "No Reference Parts",
+                    f"No reference parts found for project {project_number}.\n\n"
+                    "Proposals will use generic names (lower confidence).\n\n"
+                    "Continue anyway?",
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+                )
+                if ret != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Database Error",
+                f"Could not check reference parts: {e}"
+            )
+            return
+        
+        # Disable button and show progress
+        self.btn_propose.setEnabled(False)
+        self.status.showMessage(f"Generating proposals for {len(rows)} files...")
+        
+        # Run worker in background
+        worker = ProposeWorker(
+            propose_for_rows,
+            rows,
+            str(DB_PATH),
+            project_number.strip()
+        )
+        
+        worker.signals.finished.connect(self._apply_proposals_to_ui)
+        worker.signals.error.connect(self._on_propose_error)
+        
+        self.threadpool.start(worker)
+
+    def _on_propose_error(self, error_msg: str):
+        """Handle proposal generation error."""
+        self.btn_propose.setEnabled(True)
+        self.status.clearMessage()
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Propose Names Error",
+            f"Failed to generate proposals:\n\n{error_msg}"
+        )
+
+    def _apply_proposals_to_ui(self, proposals: list[dict]):
+        """Update UI with proposal results."""
+        if not proposals:
+            self.btn_propose.setEnabled(True)
+            self.status.showMessage("No proposals generated.", 3000)
+            return
+        
+        # Update database with proposals
+        try:
+            batch_update_proposals(proposals)
+        except Exception as e:
+            print(f"Warning: Could not update database: {e}")
+        
+        # Re-enable button
+        self.btn_propose.setEnabled(True)
+        
+        # Show summary
+        needs_review = sum(1 for p in proposals if p.get("needs_review", False))
+        auto_accept = len(proposals) - needs_review
+        
+        summary_text = (
+            f"Proposal Generation Complete\n\n"
+            f"Total files: {len(proposals)}\n"
+            f"Auto-accept (≥66%): {auto_accept}\n"
+            f"Needs review (<66%): {needs_review}\n\n"
+            f"Proposals have been saved to the database.\n"
+            f"Use the migration tool to apply the changes."
+        )
+        
+        QtWidgets.QMessageBox.information(
+            self,
+            "Proposal Summary",
+            summary_text
+        )
+        
+        self.status.showMessage(
+            f"Proposals: {len(proposals)} | Auto-accept: {auto_accept} | Needs review: {needs_review}",
+            7000
+        )
+        
+        # Refresh table to show updated data
+        self.refresh_table()
 
 def main():
     app = QtWidgets.QApplication(sys.argv)

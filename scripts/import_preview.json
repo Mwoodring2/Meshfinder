@@ -1,0 +1,21 @@
+{
+  "script_path": "/mnt/data/import_label_excel_to_modelfinder.py",
+  "input_file": "/mnt/data/300868 Superman PF.xlsx",
+  "output_csv": "/mnt/data/project_300868_superman_pf_parts.csv",
+  "parsed": {
+    "project_number": "300868",
+    "project_name": "Superman PF",
+    "sample_parts": [
+      "head",
+      "body",
+      "right_arm",
+      "right_thigh",
+      "right_boot",
+      "left_boot",
+      "cape",
+      "smoke_base",
+      "smoke1",
+      "smoke2"
+    ]
+  }
+}
