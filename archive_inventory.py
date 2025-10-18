@@ -102,3 +102,37 @@ if __name__ == "__main__":
         files.sort(key=lambda x: x['size_mb'], reverse=True)
         for f in files[:10]:
             print(f"  {f['size_mb']:.1f} MB - {f['name']}")
+
+def save_to_training_db(file_list, db_path="data/db/index.db"):
+    """
+    Saves scanned 3D files to a training_candidates table for future ML training.
+    """
+    import sqlite3
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS training_candidates(
+      id INTEGER PRIMARY KEY,
+      path TEXT UNIQUE,
+      name TEXT,
+      extension TEXT,
+      size_mb REAL,
+      modified REAL
+    )
+    """)
+    for f in file_list:
+        cur.execute("""
+          INSERT OR IGNORE INTO training_candidates(path, name, extension, size_mb, modified)
+          VALUES(?,?,?,?,?)
+        """, (f['path'], f['name'], f['extension'], f['size_mb'], f['modified']))
+    con.commit(); con.close()
+    print(f"✅ Added {len(file_list)} candidates to training_candidates table.")
+
+# Auto-save when running as standalone
+if __name__ == "__main__":
+    archive_path = input("Enter the full path to your 3D archive folder: ").strip()
+    if not os.path.exists(archive_path):
+        print(f"❌ Path doesn't exist: {archive_path}")
+    else:
+        stats, files = scan_3d_archive(archive_path)
+        save_to_training_db(files)

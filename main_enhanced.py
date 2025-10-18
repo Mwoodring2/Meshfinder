@@ -30,7 +30,7 @@ try:
     from src.features.migrate_flow import MigrationGuardrails
     from src.ui.workers import ProposeWorker
     from src.dataio.db import batch_update_proposals, add_user_correction, ensure_user_corrections
-    from src.ml.active_learning import ActiveLearningSystem, retrain_from_corrections
+    from src.ml.active_learning import retrain_from_corrections
     from src.utils.mesh_validation import MeshValidator
     _PROPOSAL_AVAILABLE = True
 except ImportError:
@@ -51,9 +51,6 @@ except ImportError:
         def __init__(self, *args, **kwargs):
             pass
     
-    class ActiveLearningSystem:
-        def __init__(self, *args, **kwargs):
-            pass
     
     class MeshValidator:
         def __init__(self, *args, **kwargs):

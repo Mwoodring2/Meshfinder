@@ -20,8 +20,24 @@ def ensure_user_corrections():
       part_type TEXT,
       laterality TEXT,
       confidence REAL,
-      corrected_utc TEXT
+      corrected_utc TEXT,
+      used_for_training INTEGER DEFAULT 0
     )""")
+    
+    # Check if corrected_utc column exists, if not add it
+    try:
+        cur.execute("SELECT corrected_utc FROM user_corrections LIMIT 1")
+    except sqlite3.OperationalError:
+        # Column doesn't exist, add it
+        cur.execute("ALTER TABLE user_corrections ADD COLUMN corrected_utc TEXT")
+    
+    # Check if used_for_training column exists, if not add it
+    try:
+        cur.execute("SELECT used_for_training FROM user_corrections LIMIT 1")
+    except sqlite3.OperationalError:
+        # Column doesn't exist, add it
+        cur.execute("ALTER TABLE user_corrections ADD COLUMN used_for_training INTEGER DEFAULT 0")
+    
     cur.execute("CREATE INDEX IF NOT EXISTS idx_uc_path ON user_corrections(file_path)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_uc_time ON user_corrections(corrected_utc)")
     con.commit(); con.close()
@@ -100,3 +116,6 @@ def batch_update_proposals(proposals: List[Dict[str, Any]]) -> int:
     
     con.commit(); con.close()
     return updated
+
+# Ensure user_corrections table exists when module is imported
+ensure_user_corrections()
