@@ -60,3 +60,43 @@ def clear_user_corrections(ids: Iterable[int]) -> int:
     n = cur.rowcount
     con.commit(); con.close()
     return n
+
+def update_file_record(old_path: str, new_path: str):
+    """Update file record in database after migration/rename"""
+    con = _con(); cur = con.cursor()
+    cur.execute("""
+        UPDATE files 
+        SET path = ?, migration_dest = ?, migration_status = 'migrated'
+        WHERE path = ?
+    """, (new_path, new_path, old_path))
+    con.commit(); con.close()
+
+def batch_update_proposals(proposals: List[Dict[str, Any]]) -> int:
+    """Batch update proposals in database"""
+    if not proposals:
+        return 0
+    
+    con = _con(); cur = con.cursor()
+    updated = 0
+    
+    for proposal in proposals:
+        try:
+            cur.execute("""
+                UPDATE files 
+                SET project_number = ?, project_name = ?, part_name = ?, 
+                    proposed_name = ?, type_conf = ?
+                WHERE path = ?
+            """, (
+                proposal.get('project_number'),
+                proposal.get('project_name'),
+                proposal.get('part_name'),
+                proposal.get('proposed_name'),
+                proposal.get('conf'),
+                proposal.get('from')
+            ))
+            updated += cur.rowcount
+        except Exception as e:
+            print(f"Failed to update proposal for {proposal.get('from')}: {e}")
+    
+    con.commit(); con.close()
+    return updated

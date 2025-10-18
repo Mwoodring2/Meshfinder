@@ -1,6 +1,8 @@
 ﻿PySide6>=6.6
 numpy
+scipy
 trimesh
+pyglet
 PyOpenGL
 PyOpenGL-accelerate
 pandas
