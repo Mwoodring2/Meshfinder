@@ -21,15 +21,25 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # Optional PIL for thumbnail generation
 try:
     from PIL import Image, ImageQt  # type: ignore
+    _PIL_AVAILABLE = True
 except Exception:
-    pass
+    _PIL_AVAILABLE = False
+
+# Optional trimesh for 3D geometry processing
+try:
+    import trimesh  # type: ignore
+    _GEO_AVAILABLE = True
+except Exception:
+    _GEO_AVAILABLE = False
+
+# Import core database functions (always needed)
+from src.dataio.db import ensure_user_corrections, add_user_correction, batch_update_proposals
 
 # Try to import proposal system components
 try:
     from src.features.propose_from_reference import propose_for_rows, RowMeta
     from src.features.migrate_flow import MigrationGuardrails
     from src.ui.workers import ProposeWorker
-    from src.dataio.db import batch_update_proposals, add_user_correction, ensure_user_corrections
     from src.ml.active_learning import retrain_from_corrections
     from src.utils.mesh_validation import MeshValidator
     _PROPOSAL_AVAILABLE = True
@@ -118,11 +128,13 @@ class EnhancedFileTableModel(QtCore.QAbstractTableModel):
     
     def __init__(self):
         super().__init__()
-        self.rows: list[tuple] = []
+        self.rows: list[tuple] = []  # Currently displayed rows (filtered)
+        self.all_rows: list[tuple] = []  # All loaded rows (unfiltered)
 
     def set_rows(self, rows: list[tuple]):
         self.beginResetModel()
         self.rows = rows
+        self.all_rows = rows.copy()  # Keep a copy of all data
         self.endResetModel()
 
     def rowCount(self, parent=QtCore.QModelIndex()):
@@ -639,32 +651,195 @@ class ThumbnailGenWorker(QtCore.QRunnable):
         self.size = size
 
     def run(self):
-        """Generate thumbnail using trimesh scene rendering"""
-        if not _GEO_AVAILABLE:
+        """Generate thumbnail using trimesh with fallback methods"""
+        if not _GEO_AVAILABLE or not _PIL_AVAILABLE:
             return
         
         try:
             import trimesh
+            import numpy as np
+            from PIL import Image, ImageDraw, ImageFont
+            
+            # Load mesh
             m = trimesh.load(self.file_path, force='mesh', skip_materials=True)
             if m is None:
                 return
             
-            # Render the mesh to PNG using trimesh's scene
-            png = m.scene().save_image(
-                resolution=(self.size, self.size), 
-                visible=True, 
-                background=[43, 43, 43, 255]  # Dark gray background
-            )
+            # Try to use trimesh's built-in rendering (requires pyglet<2)
+            try:
+                png = m.scene().save_image(
+                    resolution=(self.size, self.size), 
+                    visible=True, 
+                    background=[43, 43, 43, 255]
+                )
+                
+                if png:
+                    pm = QtGui.QPixmap()
+                    pm.loadFromData(png, "PNG")
+                    
+                    if not pm.isNull():
+                        self.cache.save_thumbnail(self.file_path, pm)
+                        return
+            except Exception as render_error:
+                # Rendering failed - use fallback icon generation
+                pass
             
-            if not png:
-                return
+            # Create a Windows File Explorer-style solid mesh preview
+            img = Image.new('RGB', (self.size, self.size), color=(240, 240, 240))  # Light background like Windows
+            draw = ImageDraw.Draw(img)
             
-            # Convert PNG bytes to QPixmap
+            try:
+                vertices = m.vertices if hasattr(m, 'vertices') else []
+                faces = m.faces if hasattr(m, 'faces') else []
+                
+                if vertices is not None and len(vertices) > 0 and faces is not None and len(faces) > 0:
+                    # Calculate mesh bounds and center
+                    min_coords = vertices.min(axis=0)
+                    max_coords = vertices.max(axis=0)
+                    center = (min_coords + max_coords) / 2
+                    
+                    # Normalize vertices to fit in preview with padding
+                    max_dim = np.max(max_coords - min_coords)
+                    if max_dim > 0:
+                        vertices_normalized = (vertices - center) / max_dim * (self.size * 0.7)
+                        
+                        # Better 3D to 2D projection (isometric with slight perspective)
+                        vertices_2d = np.zeros((len(vertices_normalized), 2))
+                        # Isometric projection with slight Z depth
+                        vertices_2d[:, 0] = (vertices_normalized[:, 0] * 0.866 - vertices_normalized[:, 2] * 0.5) + self.size/2
+                        vertices_2d[:, 1] = (vertices_normalized[:, 1] * 0.866 + vertices_normalized[:, 0] * 0.5 + vertices_normalized[:, 2] * 0.5) + self.size/2
+                        
+                        # Create a proper depth buffer for z-buffering
+                        depth_buffer = np.full((self.size, self.size), -np.inf)
+                        color_buffer = np.zeros((self.size, self.size, 3), dtype=np.uint8)
+                        color_buffer.fill(240)  # Background color
+                        
+                        # Sample faces for performance (max 2000 faces for preview)
+                        face_sample_rate = max(1, len(faces) // 2000)
+                        sampled_faces = faces[::face_sample_rate]
+                        
+                        # Calculate face normals for lighting
+                        face_normals = []
+                        face_centers = []
+                        face_depths = []
+                        
+                        for face in sampled_faces:
+                            if len(face) >= 3:
+                                # Get face vertices
+                                v1 = vertices_normalized[face[0]]
+                                v2 = vertices_normalized[face[1]]
+                                v3 = vertices_normalized[face[2]]
+                                
+                                # Calculate face normal
+                                edge1 = v2 - v1
+                                edge2 = v3 - v1
+                                normal = np.cross(edge1, edge2)
+                                normal_len = np.linalg.norm(normal)
+                                if normal_len > 0:
+                                    normal = normal / normal_len
+                                
+                                face_center = (v1 + v2 + v3) / 3
+                                face_depth = face_center[2]
+                                
+                                face_normals.append(normal)
+                                face_centers.append(face_center)
+                                face_depths.append((face_depth, face, normal, face_center))
+                        
+                        # Sort faces by depth (back to front)
+                        face_depths.sort(key=lambda x: x[0])
+                        
+                        # Light direction (from top-left)
+                        light_dir = np.array([-0.5, -0.5, 1.0])
+                        light_dir = light_dir / np.linalg.norm(light_dir)
+                        
+                        # Render faces with proper shading
+                        for face_depth, face, normal, face_center in face_depths:
+                            if len(face) >= 3:
+                                try:
+                                    # Get face vertices in 2D
+                                    face_2d = vertices_2d[face[:3]]
+                                    
+                                    # Calculate face bounds
+                                    min_x = int(np.min(face_2d[:, 0]))
+                                    max_x = int(np.max(face_2d[:, 0]))
+                                    min_y = int(np.min(face_2d[:, 1]))
+                                    max_y = int(np.max(face_2d[:, 1]))
+                                    
+                                    # Skip if face is completely outside bounds
+                                    if max_x < 0 or min_x >= self.size or max_y < 0 or min_y >= self.size:
+                                        continue
+                                    
+                                    # Clamp bounds
+                                    min_x = max(0, min_x)
+                                    max_x = min(self.size - 1, max_x)
+                                    min_y = max(0, min_y)
+                                    max_y = min(self.size - 1, max_y)
+                                    
+                                    # Calculate lighting (Lambert shading)
+                                    light_intensity = max(0.3, np.dot(normal, light_dir))
+                                    
+                                    # Base color (grey like Windows)
+                                    base_color = 180
+                                    shaded_color = int(base_color * light_intensity)
+                                    face_color = (shaded_color, shaded_color, shaded_color)
+                                    
+                                    # Create polygon points for rasterization
+                                    polygon_points = [(int(p[0]), int(p[1])) for p in face_2d]
+                                    
+                                    # Draw filled triangle with proper color
+                                    draw.polygon(polygon_points, fill=face_color)
+                                    
+                                except (IndexError, ValueError):
+                                    continue
+                        
+                        # Add subtle edge lines for definition
+                        edge_sample_rate = max(1, len(faces) // 500)  # Sample fewer edges
+                        for face in faces[::edge_sample_rate]:
+                            if len(face) >= 3:
+                                try:
+                                    face_2d = vertices_2d[face[:3]]
+                                    # Draw triangle edges
+                                    for i in range(3):
+                                        start = face_2d[i]
+                                        end = face_2d[(i + 1) % 3]
+                                        if (0 <= start[0] < self.size and 0 <= start[1] < self.size and
+                                            0 <= end[0] < self.size and 0 <= end[1] < self.size):
+                                            draw.line([(int(start[0]), int(start[1])), (int(end[0]), int(end[1]))], 
+                                                     fill=(120, 120, 120), width=1)
+                                except (IndexError, ValueError):
+                                    continue
+                    
+                    # Add clean border like Windows
+                    padding = 2
+                    draw.rectangle([padding, padding, self.size - padding, self.size - padding],
+                                 outline=(200, 200, 200), width=1)
+                    
+                else:
+                    # No valid geometry - show clean placeholder
+                    center_x, center_y = self.size // 2, self.size // 2
+                    draw.ellipse([center_x - 15, center_y - 15, center_x + 15, center_y + 15],
+                               fill=(220, 220, 220), outline=(150, 150, 150), width=1)
+                    draw.text((center_x - 8, center_y - 5), "3D", fill=(100, 100, 100))
+                
+            except Exception as render_error:
+                # Clean fallback
+                center_x, center_y = self.size // 2, self.size // 2
+                draw.rectangle([center_x - 12, center_y - 12, center_x + 12, center_y + 12],
+                             fill=(220, 220, 220), outline=(150, 150, 150), width=1)
+                draw.text((center_x - 8, center_y - 5), "3D", fill=(100, 100, 100))
+            
+            # Convert PIL image to QPixmap
+            import io
+            buffer = io.BytesIO()
+            img.save(buffer, format='PNG')
+            buffer.seek(0)
+            
             pm = QtGui.QPixmap()
-            pm.loadFromData(png, "PNG")
+            pm.loadFromData(buffer.read(), "PNG")
             
             if not pm.isNull():
                 self.cache.save_thumbnail(self.file_path, pm)
+                
         except Exception as e:
             # Silently fail - thumbnail generation is optional
             print(f"Thumbnail generation failed for {self.file_path}: {e}")
@@ -1079,17 +1254,56 @@ class TrainingDialog(QtWidgets.QDialog):
         layout.addLayout(btn_row)
     
     def _add_training_folder(self):
-        """Add folder for training"""
+        """Add folder for training with validation"""
         folder = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Select Well-Organized Project Folder",
             str(Path.home())
         )
         
         if folder:
-            self.training_folders.append(folder)
-            self.folders_list.addItem(folder)
-            self.btn_scan.setEnabled(True)
-            self.status_label.setText(f"{len(self.training_folders)} folder(s) selected")
+            # Validate folder
+            if folder in self.training_folders:
+                QtWidgets.QMessageBox.warning(self, "Duplicate Folder", 
+                    "This folder is already in the training list.")
+                return
+            
+            # Check if folder contains 3D files
+            try:
+                from pathlib import Path
+                folder_path = Path(folder)
+                if not folder_path.exists():
+                    QtWidgets.QMessageBox.warning(self, "Invalid Folder", 
+                        "Selected folder does not exist.")
+                    return
+                
+                # Count 3D files in folder
+                extensions = {'.stl', '.obj', '.ply', '.fbx', '.glb'}
+                file_count = sum(1 for f in folder_path.rglob('*') 
+                               if f.suffix.lower() in extensions)
+                
+                if file_count == 0:
+                    reply = QtWidgets.QMessageBox.question(
+                        self, "No 3D Files Found", 
+                        f"No 3D files found in {folder_path.name}.\n"
+                        f"Do you want to add it anyway?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+                    )
+                    if reply != QtWidgets.QMessageBox.Yes:
+                        return
+                else:
+                    QtWidgets.QMessageBox.information(
+                        self, "Folder Added", 
+                        f"Added {folder_path.name} with {file_count} 3D files."
+                    )
+                
+                self.training_folders.append(folder)
+                self.folders_list.addItem(folder)
+                self.btn_scan.setEnabled(True)
+                self.status_label.setText(f"{len(self.training_folders)} folder(s) selected")
+                
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", 
+                    f"Error accessing folder: {e}")
     
     def _remove_training_folder(self):
         """Remove selected folder from list"""
@@ -2426,7 +2640,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Edit Menu
         edit_menu = menubar.addMenu("&Edit")
-        edit_menu.addAction("&Find...", self._find_dialog, "Ctrl+F")
+        edit_menu.addAction("&Find...", self._focus_search, "Ctrl+F")
         edit_menu.addAction("Find &Next", self._find_next, "F3")
         edit_menu.addAction("Find &Previous", self._find_previous, "Shift+F3")
         edit_menu.addSeparator()
@@ -2455,15 +2669,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction("&Compute Geometry", self._start_geometry_compute, "Ctrl+G")
         tools_menu.addAction("&Build Similarity Index", self._rebuild_similarity_index, "Ctrl+B")
         tools_menu.addSeparator()
-        tools_menu.addAction("📦 Migrate Archive...", self._open_migration_planner)
-        tools_menu.addAction("🎓 Train from Archive...", self._open_training_dialog)
-        tools_menu.addAction("🔄 Retrain from Corrections...", self._on_retrain_from_corrections)
-        tools_menu.addSeparator()
+        tools_menu.addAction("📦 &Migrate Archive...", self._open_migration_planner, "Ctrl+M")
         tools_menu.addAction("🎓 &Train from Archive...", self._open_training_dialog, "Ctrl+Shift+T")
+        tools_menu.addAction("🔄 Retrain from Corrections...", self._on_retrain_from_corrections)
         if _PROPOSAL_AVAILABLE:
             tools_menu.addAction("&Propose Names...", self.on_propose_names_clicked, "Ctrl+P")
-        tools_menu.addSeparator()
-        tools_menu.addAction("📦 &Migrate Archive...", self._open_migration_planner, "Ctrl+M")
         tools_menu.addSeparator()
         tools_menu.addAction("&Database Manager...", self._database_manager, "Ctrl+D")
         tools_menu.addAction("&Settings...", self._show_settings, "Ctrl+,")
@@ -2533,24 +2743,9 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(self.filters_panel)
         layout.setContentsMargins(10, 10, 10, 10)
         
-        # Mode toggle button
-        self.btn_panel_mode = QtWidgets.QPushButton("📂 Folder Browser")
-        self.btn_panel_mode.setToolTip("Switch to folder browser view")
-        self.btn_panel_mode.clicked.connect(self._toggle_left_panel_mode)
-        layout.addWidget(self.btn_panel_mode)
-        
-        # Create stacked widget for filters and browser
-        self.left_panel_stack = QtWidgets.QStackedWidget()
-        layout.addWidget(self.left_panel_stack)
-        
-        # Build filters widget
-        self._build_filters_widget()
-        
-        # Build browser widget
-        self._build_browser_widget()
-        
-        # Set initial mode
-        self.left_panel_stack.setCurrentIndex(0)  # Start with filters
+        # Build filters widget (no folder browser in left panel)
+        filters_widget = self._build_filters_widget()
+        layout.addWidget(filters_widget)
     
     def _build_filters_widget(self):
         """Build the filters widget for the left panel"""
@@ -2632,8 +2827,8 @@ class MainWindow(QtWidgets.QMainWindow):
         
         filters_layout.addStretch()
         
-        # Add to stack
-        self.left_panel_stack.addWidget(filters_widget)
+        # Return the filters widget
+        return filters_widget
     
     def _build_browser_widget(self):
         """Build the folder browser widget for the left panel"""
@@ -2657,14 +2852,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_system_model = QtWidgets.QFileSystemModel()
         self.file_system_model.setRootPath("")
         
-        # Filter to show only directories and 3D model files
-        file_filters = ["*" + ext for ext in SUPPORTED_EXTS]
-        self.file_system_model.setNameFilters(file_filters)
-        self.file_system_model.setNameFilterDisables(False)  # Hide files that don't match
+        # Show only directories (folders) - no files
+        self.file_system_model.setFilter(QtCore.QDir.Filter.Dirs | QtCore.QDir.Filter.NoDotAndDotDot)
         
         self.folder_tree.setModel(self.file_system_model)
         
-        # Show only Name column by default
+        # Show only Name column - hide size, type, date columns
         for i in range(1, self.file_system_model.columnCount()):
             self.folder_tree.hideColumn(i)
         
@@ -2689,63 +2882,10 @@ class MainWindow(QtWidgets.QMainWindow):
         
         browser_layout.addWidget(self.folder_tree)
         
-        # Add navigation buttons
-        nav_layout = QtWidgets.QHBoxLayout()
-        
-        btn_home = QtWidgets.QPushButton("🏠")
-        btn_home.setToolTip("Go to Home")
-        btn_home.setMaximumWidth(40)
-        btn_home.clicked.connect(lambda: self._navigate_to(str(Path.home())))
-        nav_layout.addWidget(btn_home)
-        
-        btn_root = QtWidgets.QPushButton("💾")
-        btn_root.setToolTip("Show All Drives")
-        btn_root.setMaximumWidth(40)
-        btn_root.clicked.connect(lambda: self._navigate_to(""))
-        nav_layout.addWidget(btn_root)
-        
-        btn_up = QtWidgets.QPushButton("⬆️")
-        btn_up.setToolTip("Go Up One Level")
-        btn_up.setMaximumWidth(40)
-        btn_up.clicked.connect(self._navigate_up)
-        nav_layout.addWidget(btn_up)
-        
-        browser_layout.addLayout(nav_layout)
-        
-        # Add to stack
-        self.left_panel_stack.addWidget(browser_widget)
+        # Simple folder browser - no navigation buttons needed
+        return browser_widget
     
-    def _toggle_left_panel_mode(self):
-        """Toggle between filters and folder browser"""
-        if self.left_panel_mode == "filters":
-            self.left_panel_mode = "browser"
-            self.left_panel_stack.setCurrentIndex(1)
-            self.btn_panel_mode.setText("🔍 Filters")
-            self.btn_panel_mode.setToolTip("Switch to filters view")
-            self.status.showMessage("Switched to Folder Browser", 2000)
-        else:
-            self.left_panel_mode = "filters"
-            self.left_panel_stack.setCurrentIndex(0)
-            self.btn_panel_mode.setText("📂 Folder Browser")
-            self.btn_panel_mode.setToolTip("Switch to folder browser view")
-            self.status.showMessage("Switched to Filters", 2000)
     
-    def _navigate_to(self, path: str):
-        """Navigate to a specific path in the folder browser"""
-        index = self.file_system_model.index(path)
-        if index.isValid():
-            self.folder_tree.setRootIndex(index)
-            self.folder_tree.setCurrentIndex(index)
-    
-    def _navigate_up(self):
-        """Navigate up one level in the folder browser"""
-        current_root = self.folder_tree.rootIndex()
-        parent = current_root.parent()
-        if parent.isValid():
-            self.folder_tree.setRootIndex(parent)
-        else:
-            # Go to root (show all drives)
-            self.folder_tree.setRootIndex(QtCore.QModelIndex())
     
     def _on_folder_selected(self, selected, deselected):
         """Handle folder selection in browser"""
@@ -2759,19 +2899,191 @@ class MainWindow(QtWidgets.QMainWindow):
         # If it's a directory, filter table to show files in that directory
         if self.file_system_model.isDir(index):
             self._filter_table_by_folder(file_path)
-        # If it's a file, show it in preview/3D viewer
+        # If it's a file, show it in preview automatically
         else:
             # Check if it's a 3D model file
             if Path(file_path).suffix.lower() in SUPPORTED_EXTS:
                 self._preview_file(file_path)
     
     def _filter_table_by_folder(self, folder_path: str):
-        """Filter table to show only files in the selected folder"""
-        # Update the current scan roots to include this folder
-        self.current_scan_roots = [Path(folder_path)]
-        self.show_all_files = False
-        self.refresh_table()
-        self.status.showMessage(f"Showing files in: {folder_path}", 3000)
+        """Load and display files from the selected folder"""
+        try:
+            # Store the current folder filter
+            self.current_folder_filter = folder_path
+            self.show_all_files = False
+            
+            # Quick load files directly from the filesystem
+            self._quick_load_folder(folder_path)
+            
+        except Exception as e:
+            print(f"Error loading folder: {e}")
+            self.status.showMessage(f"Error loading folder: {e}", 3000)
+    
+    def _quick_load_folder(self, folder_path: str):
+        """Quickly load files from a folder directly into the table"""
+        try:
+            folder = Path(folder_path)
+            if not folder.exists() or not folder.is_dir():
+                self.status.showMessage(f"Invalid folder: {folder_path}", 3000)
+                return
+            
+            self.status.showMessage(f"Loading files from: {folder.name}...", 0)
+            QtWidgets.QApplication.processEvents()  # Update UI
+            
+            # Find all 3D files in the folder and subfolders
+            rows = []
+            supported_exts = {'.stl', '.obj', '.ply', '.glb', '.fbx', '.3mf', '.off'}
+            
+            file_count = 0
+            for file_path in folder.rglob('*'):
+                if file_path.is_file() and file_path.suffix.lower() in supported_exts:
+                    try:
+                        stat = file_path.stat()
+                        
+                        # Build row data: [path, name, ext, size, mtime, tags, ...]
+                        row = [
+                            str(file_path),           # 0: path
+                            file_path.name,           # 1: name
+                            file_path.suffix,         # 2: ext
+                            stat.st_size,             # 3: size
+                            stat.st_mtime,            # 4: mtime
+                            "",                       # 5: tags (empty for now)
+                            None,                     # 6: tris
+                            None,                     # 7: dx
+                            None,                     # 8: dy
+                            None,                     # 9: dz
+                            "",                       # 10: hash
+                            "",                       # 11: project_number
+                            "",                       # 12: project_name
+                            "",                       # 13: part_name
+                            "",                       # 14: proposed_name
+                            0.0,                      # 15: confidence
+                            False                     # 16: needs_review
+                        ]
+                        rows.append(tuple(row))
+                        file_count += 1
+                        
+                        # Update UI periodically
+                        if file_count % 50 == 0:
+                            self.status.showMessage(f"Loading files: {file_count} found...", 0)
+                            QtWidgets.QApplication.processEvents()
+                            
+                    except Exception as e:
+                        print(f"Error reading file {file_path}: {e}")
+                        continue
+            
+            # Update the table model
+            if hasattr(self, 'model') and self.model:
+                self.model.set_rows(rows)
+                self.status.showMessage(f"Loaded {file_count} files from: {folder.name}", 5000)
+            else:
+                self.status.showMessage("Table not initialized", 3000)
+                
+        except Exception as e:
+            print(f"Error quick loading folder: {e}")
+            self.status.showMessage(f"Error loading folder: {e}", 3000)
+    
+    def _apply_folder_filter(self, folder_path: str):
+        """Apply folder filter to existing table data"""
+        try:
+            if not hasattr(self, 'model') or not self.model:
+                return
+            
+            # Convert to Path for consistent comparison
+            folder_path = Path(folder_path).resolve()
+            
+            # Filter the existing rows to show only files in this folder
+            filtered_rows = []
+            for row in self.model.all_rows:  # Assuming all_rows contains all data
+                if len(row) > 0:
+                    file_path = Path(row[0]).resolve()
+                    try:
+                        # Check if file is in the selected folder or its subfolders
+                        if file_path.is_relative_to(folder_path) or file_path.parent == folder_path:
+                            filtered_rows.append(row)
+                    except ValueError:
+                        # Path is not relative to folder, skip
+                        continue
+            
+            # Update the model with filtered data
+            self.model.rows = filtered_rows
+            self.model.layoutChanged.emit()
+            
+            # Update status
+            count = len(filtered_rows)
+            self.status.showMessage(f"Showing {count} files in: {folder_path.name}", 3000)
+            
+        except Exception as e:
+            print(f"Error applying folder filter: {e}")
+            # Fallback to refresh if filtering fails
+            self.refresh_table()
+    
+    def _clear_folder_filter(self):
+        """Clear the current folder filter and show all files"""
+        if hasattr(self, 'current_folder_filter'):
+            self.current_folder_filter = None
+        self.show_all_files = True
+        if hasattr(self, 'model') and self.model and hasattr(self.model, 'all_rows'):
+            self.model.rows = self.model.all_rows
+            self.model.layoutChanged.emit()
+        self.status.showMessage("Showing all files", 2000)
+    
+    def _on_search_changed(self, text: str):
+        """Handle search text changes with live filtering"""
+        if not hasattr(self, 'model') or not self.model or not hasattr(self.model, 'all_rows'):
+            return
+        
+        # Clear search if text is empty
+        if not text or len(text.strip()) == 0:
+            self.model.rows = self.model.all_rows
+            self.model.layoutChanged.emit()
+            self.status.clearMessage()
+            return
+        
+        # Search is case-insensitive
+        search_term = text.lower().strip()
+        
+        # Filter rows by search term (search in name, path, tags, extension)
+        filtered_rows = []
+        for row in self.model.all_rows:
+            if len(row) < 6:
+                continue
+            
+            # Search in: name, extension, tags, path
+            name = (row[1] or "").lower()
+            ext = (row[2] or "").lower()
+            tags = (row[5] or "").lower()
+            path = (row[0] or "").lower()
+            
+            if (search_term in name or 
+                search_term in ext or 
+                search_term in tags or 
+                search_term in path):
+                filtered_rows.append(row)
+        
+        # Update table
+        self.model.rows = filtered_rows
+        self.model.layoutChanged.emit()
+        
+        # Update status
+        count = len(filtered_rows)
+        self.status.showMessage(f"Found {count} file(s) matching '{text}'", 3000)
+    
+    def _on_search_submit(self):
+        """Handle Enter key in search box"""
+        if hasattr(self, 'table') and self.table.model() and self.table.model().rowCount() > 0:
+            # Select first result
+            self.table.selectRow(0)
+            self.table.setFocus()
+            self.status.showMessage("Press Enter to open, or use arrow keys to browse", 3000)
+    
+    def _focus_search(self):
+        """Focus the search input (Ctrl+F)"""
+        if hasattr(self, 'search_input'):
+            self.search_input.setFocus()
+            self.search_input.selectAll()
+            self.status.showMessage("Type to search files...", 2000)
+    
     
     def _show_browser_context_menu(self, position):
         """Show context menu for browser tree view"""
@@ -2826,10 +3138,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.toolbar = QtWidgets.QToolBar()
         self.toolbar.setMovable(False)
         
-        # Scan buttons
+        # Browse and Scan buttons
+        btn_browse = QtWidgets.QToolButton()
+        btn_browse.setText("📁 Browse Folder...")
+        btn_browse.setToolTip("Open a folder to scan and index (recommended for fast, focused scans)")
+        btn_browse.clicked.connect(self._browse_and_scan_folder)
+        self.toolbar.addWidget(btn_browse)
+        
         btn_scan = QtWidgets.QToolButton()
         btn_scan.setText("📁 Scan Folders")
-        btn_scan.setToolTip("Scan selected folders for 3D assets")
+        btn_scan.setToolTip("Select multiple folders to scan for 3D assets (STL, OBJ, FBX, etc.)")
         btn_scan.clicked.connect(self.choose_and_scan)
         self.toolbar.addWidget(btn_scan)
         
@@ -2842,12 +3160,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.toolbar.addSeparator()
         
         # Search
-        self.search_edit = QtWidgets.QLineEdit()
-        self.search_edit.setPlaceholderText("Search by name or tags...")
-        self.search_edit.setMaximumWidth(200)
-        self.search_edit.textChanged.connect(self.refresh_table)
-        self.toolbar.addWidget(QtWidgets.QLabel("Search:"))
-        self.toolbar.addWidget(self.search_edit)
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.setPlaceholderText("Search by name or tags...")
+        self.search_input.setMinimumWidth(250)
+        self.search_input.setMaximumWidth(400)
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self._on_search_changed)
+        self.search_input.returnPressed.connect(self._on_search_submit)
+        self.search_input.setToolTip("Search files by name, extension, or tags - results update automatically (Ctrl+F)")
+        
+        search_label = QtWidgets.QLabel("🔍 ")
+        search_label.setStyleSheet("font-size: 14px;")
+        self.toolbar.addWidget(search_label)
+        self.toolbar.addWidget(self.search_input)
+        
+        # Also keep reference as search_edit for backward compatibility
+        self.search_edit = self.search_input
         
         self.toolbar.addSeparator()
         
@@ -2860,18 +3188,8 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self.toolbar.addSeparator()
         
-        # Advanced features
-        self.btn_compute_geo = QtWidgets.QToolButton()
-        self.btn_compute_geo.setText("🔍 Compute Geometry")
-        self.btn_compute_geo.setToolTip("Compute triangle counts and dimensions")
-        self.btn_compute_geo.clicked.connect(self._start_geometry_compute)
-        self.toolbar.addWidget(self.btn_compute_geo)
-        
-        self.btn_build_sim = QtWidgets.QToolButton()
-        self.btn_build_sim.setText("🔎 Build Similarity")
-        self.btn_build_sim.setToolTip("Build similarity search index")
-        self.btn_build_sim.clicked.connect(self._rebuild_similarity_index)
-        self.toolbar.addWidget(self.btn_build_sim)
+        # Advanced features (moved to menu - auto-computed during scan)
+        # Geometry is now auto-computed during scanning for better UX
         
         self.toolbar.addSeparator()
         
@@ -2948,7 +3266,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.customContextMenuRequested.connect(self._show_context_menu)
 
     def _build_preview_panel(self):
-        """Build the right preview/metadata panel with lightweight thumbnails"""
+        """Build the right preview/metadata panel with thumbnail"""
         self.preview_panel = QtWidgets.QWidget()
         self.preview_panel.setMinimumWidth(250)
         self.preview_panel.setMaximumWidth(320)
@@ -2959,10 +3277,8 @@ class MainWindow(QtWidgets.QMainWindow):
         title.setStyleSheet("font-weight:600;font-size:14px;")
         v.addWidget(title)
 
-        # cache
+        # Thumbnail cache and preview
         self.thumbnail_cache = ThumbnailCache(DB_DIR / "thumbnails")
-
-        # thumbnail box
         self.preview_thumbnail = QtWidgets.QLabel("No Preview\n(select a file)")
         self.preview_thumbnail.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.preview_thumbnail.setMinimumHeight(200)
@@ -2998,26 +3314,61 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("Dimensions:", self.meta_dimensions)
         v.addWidget(box)
 
-        # quick actions
-        act = QtWidgets.QGroupBox("Quick Actions"); av = QtWidgets.QVBoxLayout(act)
-        r1 = QtWidgets.QHBoxLayout()
-        self.btn_open_file = QtWidgets.QPushButton("📂 Open");      self.btn_open_file.clicked.connect(self._open_current_file)
-        self.btn_open_folder = QtWidgets.QPushButton("📁 Folder");  self.btn_open_folder.clicked.connect(self._open_in_explorer)
-        r1.addWidget(self.btn_open_file); r1.addWidget(self.btn_open_folder); av.addLayout(r1)
-
-        r2 = QtWidgets.QHBoxLayout()
-        self.btn_copy_path = QtWidgets.QPushButton("📋 Copy Path"); self.btn_copy_path.clicked.connect(self._copy_path)
-        self.btn_generate_thumb = QtWidgets.QPushButton("🖼️ Thumbnail"); self.btn_generate_thumb.clicked.connect(self._generate_thumbnail)
-        r2.addWidget(self.btn_copy_path); r2.addWidget(self.btn_generate_thumb); av.addLayout(r2)
-
-        v.addWidget(act)
         v.addStretch(1)
         self.current_preview_file = None
 
     # Event handlers
     def _on_filter_changed(self):
-        """Handle filter changes"""
-        self.refresh_table()
+        """Handle filter changes with validation"""
+        try:
+            # Validate filter inputs before applying
+            self._validate_filters()
+            self.refresh_table()
+        except Exception as e:
+            print(f"Filter error: {e}")
+            # Reset to safe defaults
+            self._clear_filters()
+            self.refresh_table()
+    
+    def _validate_filters(self):
+        """Validate filter inputs"""
+        # Validate file size filters
+        try:
+            min_size_text = self.min_size_input.text().strip()
+            if min_size_text:
+                min_size = float(min_size_text)
+                if min_size < 0:
+                    self.min_size_input.setText("0")
+        except ValueError:
+            self.min_size_input.setText("0")
+        
+        try:
+            max_size_text = self.max_size_input.text().strip()
+            if max_size_text:
+                max_size = float(max_size_text)
+                if max_size < 0:
+                    self.max_size_input.setText("")
+        except ValueError:
+            self.max_size_input.setText("")
+        
+        # Validate triangle count filters
+        try:
+            min_tris_text = self.min_tris_input.text().strip()
+            if min_tris_text:
+                min_tris = int(min_tris_text)
+                if min_tris < 0:
+                    self.min_tris_input.setText("0")
+        except ValueError:
+            self.min_tris_input.setText("0")
+        
+        try:
+            max_tris_text = self.max_tris_input.text().strip()
+            if max_tris_text:
+                max_tris = int(max_tris_text)
+                if max_tris < 0:
+                    self.max_tris_input.setText("")
+        except ValueError:
+            self.max_tris_input.setText("")
 
     def _clear_filters(self):
         """Clear all filters"""
@@ -3060,12 +3411,50 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # geometry (if present in row ordering)
         tris = row[6] if len(row) > 6 else None
-        self.info_tris.setText(f"Tris: {tris:,}" if tris else "Tris: N/A")
+        if tris:
+            self.info_tris.setText(f"Tris: {tris:,}")
+        else:
+            self.info_tris.setText("Tris: Computing...")
+            # Trigger geometry computation for this file if missing
+            if ext.lower() in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
+                worker = GeometryWorker([path])
+                QtCore.QThreadPool.globalInstance().start(worker)
+                # Refresh preview after geometry computation
+                QtCore.QTimer.singleShot(3000, lambda: self._refresh_geometry_info(path))
+        
         if len(row) > 9:
             dx, dy, dz = row[7], row[8], row[9]
-            self.meta_dimensions.setText(f"{dx:.1f} × {dy:.1f} × {dz:.1f}" if all([dx,dy,dz]) else "N/A")
-
+            if all([dx,dy,dz]):
+                self.meta_dimensions.setText(f"{dx:.1f} × {dy:.1f} × {dz:.1f}")
+            else:
+                self.meta_dimensions.setText("Computing...")
+        else:
+            self.meta_dimensions.setText("Computing...")
+        
+        # Load thumbnail preview
         self._load_thumbnail(path, name, ext)
+    
+    def _refresh_geometry_info(self, file_path: str):
+        """Refresh geometry information after computation"""
+        try:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("SELECT tris, dim_x, dim_y, dim_z FROM files WHERE path = ?", (file_path,))
+            result = cur.fetchone()
+            con.close()
+            
+            if result and result[0]:
+                tris, dx, dy, dz = result
+                self.info_tris.setText(f"Tris: {tris:,}")
+                if all([dx, dy, dz]):
+                    self.meta_dimensions.setText(f"{dx:.1f} × {dy:.1f} × {dz:.1f}")
+                else:
+                    self.meta_dimensions.setText("N/A")
+            else:
+                self.info_tris.setText("Tris: Failed")
+                self.meta_dimensions.setText("Failed")
+        except Exception as e:
+            print(f"Error refreshing geometry info: {e}")
     
     def _load_thumbnail(self, file_path: str, name: str, ext: str):
         """Load thumbnail for the given file"""
@@ -3080,7 +3469,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._display_thumbnail(cached)
             return
 
-        # 2) show neutral placeholder (not the OS/app icon)
+        # 2) For 3D files, generate thumbnail immediately
+        if ext.lower() in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
+            self.preview_thumbnail.setText("Generating 3D preview...")
+            # Generate thumbnail immediately in background
+            worker = ThumbnailGenWorker(file_path, self.thumbnail_cache, 256)
+            QtCore.QThreadPool.globalInstance().start(worker)
+            # Refresh after generation
+            QtCore.QTimer.singleShot(2000, lambda: self._refresh_if_cache_ready(file_path))
+            return
+
+        # 3) For other files, show neutral placeholder
         ph = QtGui.QPixmap(160, 160)
         ph.fill(QtGui.QColor("#2b2b2b"))
         painter = QtGui.QPainter(ph)
@@ -3094,7 +3493,7 @@ class MainWindow(QtWidgets.QMainWindow):
         painter.end()
         self._display_thumbnail(ph)
 
-        # 3) (optional) kick off background generation if enabled
+        # 4) kick off background generation for other files if enabled
         if self.settings.value("thumbs.autogen", "true").lower() == "true":
             self._schedule_thumbnail_generate(file_path)
 
@@ -3157,10 +3556,30 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.current_preview_file and Path(self.current_preview_file).exists():
             os.startfile(self.current_preview_file)
     
-    def _open_current_file(self):
-        """Open current preview file in default application"""
-        if self.current_preview_file and Path(self.current_preview_file).exists():
-            os.startfile(self.current_preview_file)
+    
+    def _generate_thumbnail(self):
+        """Generate thumbnail for current file"""
+        try:
+            if not self.current_preview_file:
+                QtWidgets.QMessageBox.warning(self, "No File Selected", 
+                    "No file is currently selected for preview.")
+                return
+            
+            if not Path(self.current_preview_file).exists():
+                QtWidgets.QMessageBox.warning(self, "File Not Found", 
+                    "Selected file no longer exists.")
+                return
+            
+            # Generate thumbnail in background
+            worker = ThumbnailGenWorker(self.current_preview_file, self.thumbnail_cache, 256)
+            QtCore.QThreadPool.globalInstance().start(worker)
+            self.status.showMessage("Generating thumbnail...", 2500)
+            
+            # Refresh preview after generation
+            QtCore.QTimer.singleShot(1500, lambda: self._refresh_if_cache_ready(self.current_preview_file))
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Thumbnail Error", f"Failed to generate thumbnail: {e}")
 
     def _open_in_explorer(self):
         """Open selected file in Windows Explorer"""
@@ -3171,15 +3590,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if path:
                 os.startfile(str(Path(path).parent))
 
-    def _copy_path(self):
-        """Copy selected file path to clipboard"""
-        idx = self.table.currentIndex()
-        if idx.isValid():
-            row = self.model.rows[idx.row()]
-            path = row[0] if row else None
-            if path:
-                QtWidgets.QApplication.clipboard().setText(path)
-                self.status.showMessage("Path copied to clipboard", 2000)
 
     def _context_menu(self, position):
         """Show context menu for table"""
@@ -3220,6 +3630,26 @@ class MainWindow(QtWidgets.QMainWindow):
         super().keyPressEvent(event)
 
     # Placeholder methods for existing functionality
+    def _browse_and_scan_folder(self):
+        """Browse and scan a single folder (recommended approach)"""
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder to Scan and Index",
+            str(Path.home()),
+            QtWidgets.QFileDialog.Option.ShowDirsOnly
+        )
+        
+        if folder:
+            folder_path = Path(folder)
+            if folder_path.exists() and folder_path.is_dir():
+                self.status.showMessage(f"Scanning folder: {folder_path.name}...", 0)
+                QtWidgets.QApplication.processEvents()  # Update UI
+                
+                # Use the same indexing pipeline as regular scan
+                self.start_indexing([folder_path])
+            else:
+                QtWidgets.QMessageBox.warning(self, "Invalid Folder", "Selected folder does not exist or is not accessible.")
+
     def choose_and_scan(self):
         """Choose folders to scan"""
         dlg = QtWidgets.QFileDialog(self, "Select one or more folders")
@@ -3375,8 +3805,62 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_index_complete(self):
         """Handle indexing completion"""
-        self.status.showMessage("Indexing complete", 5000)
+        self.status.showMessage("Indexing complete - auto-processing files...", 5000)
         self.refresh_table()  # Refresh table with new data
+        
+        # Auto-compute geometry and thumbnails for better UX
+        QtCore.QTimer.singleShot(1000, self._auto_process_new_files)
+    
+    def _auto_process_new_files(self):
+        """Automatically process newly scanned files for better UX"""
+        try:
+            # Get all files that need geometry computation
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("SELECT path FROM files WHERE tris IS NULL LIMIT 50")  # Process first 50 files
+            files_to_process = [row[0] for row in cur.fetchall()]
+            con.close()
+            
+            if files_to_process:
+                self.status.showMessage(f"Auto-computing geometry for {len(files_to_process)} files...", 0)
+                
+                # Start geometry computation in background
+                worker = GeometryWorker(files_to_process)
+                QtCore.QThreadPool.globalInstance().start(worker)
+                
+                # Schedule thumbnail generation after geometry
+                QtCore.QTimer.singleShot(3000, self._auto_generate_thumbnails)
+            else:
+                self.status.showMessage("All files already processed", 3000)
+                
+        except Exception as e:
+            print(f"Auto-processing error: {e}")
+    
+    def _auto_generate_thumbnails(self):
+        """Automatically generate thumbnails for new files"""
+        try:
+            # Get files that might need thumbnails
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("SELECT path FROM files LIMIT 20")  # Generate thumbnails for first 20 files
+            files_for_thumbnails = [row[0] for row in cur.fetchall()]
+            con.close()
+            
+            if files_for_thumbnails:
+                self.status.showMessage("Auto-generating thumbnails...", 0)
+                
+                # Generate thumbnails in background
+                for file_path in files_for_thumbnails[:10]:  # Limit to 10 for performance
+                    if Path(file_path).exists():
+                        worker = ThumbnailGenWorker(file_path, self.thumbnail_cache, 256)
+                        QtCore.QThreadPool.globalInstance().start(worker)
+                
+                # Refresh display after thumbnails
+                QtCore.QTimer.singleShot(2000, self.refresh_table)
+                self.status.showMessage("Auto-processing complete", 3000)
+                
+        except Exception as e:
+            print(f"Auto-thumbnail generation error: {e}")
 
     def _on_index_error(self, error_msg):
         """Handle indexing errors"""
@@ -3472,16 +3956,66 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _find_similar_from_table(self, row_idx: int):
         """Find similar files and show results dialog"""
-        results = self._find_similar_for_row(row_idx)
-        if results:
-            FindSimilarResultsDialog(self, results).exec()
-        else:
-            QtWidgets.QMessageBox.information(
-                self, "Find Similar",
-                "No similar files found.\n\n"
-                "Try building the similarity index first:\n"
-                "Tools → Build Similarity Index"
-            )
+        try:
+            results = self._find_similar_for_row(row_idx)
+            if results:
+                FindSimilarResultsDialog(self, results).exec()
+            else:
+                QtWidgets.QMessageBox.information(
+                    self, "Find Similar",
+                    "No similar files found.\n\n"
+                    "Try building the similarity index first:\n"
+                    "Tools → Build Similarity Index"
+                )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to find similar files: {e}")
+    
+    def _rename_to_proposed(self, row_idx: int):
+        """Rename file to its proposed name"""
+        try:
+            if row_idx >= len(self.model.rows):
+                return
+            
+            row = self.model.rows[row_idx]
+            file_path = row[0]
+            
+            # Check if we have a proposed name in the row data
+            proposed_name = None
+            if len(row) > 10:  # Check if proposed name column exists
+                proposed_name = row[10]  # Adjust index based on your column structure
+            
+            if not proposed_name:
+                QtWidgets.QMessageBox.information(self, "No Proposed Name", 
+                    "No proposed name available for this file.")
+                return
+            
+            # Get directory and create new path
+            old_path = Path(file_path)
+            new_path = old_path.parent / proposed_name
+            
+            if new_path.exists():
+                reply = QtWidgets.QMessageBox.question(
+                    self, "File Exists", 
+                    f"File {proposed_name} already exists. Overwrite?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return
+            
+            # Rename the file
+            old_path.rename(new_path)
+            
+            # Update database
+            self._update_tags_in_db(str(new_path), "renamed")
+            
+            # Refresh table
+            self.refresh_table()
+            
+            QtWidgets.QMessageBox.information(self, "File Renamed", 
+                f"Renamed to: {proposed_name}")
+                
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Rename Error", f"Failed to rename file: {e}")
     
     # File operation methods
     def _open_file(self, file_path: str):
@@ -3840,12 +4374,40 @@ class MainWindow(QtWidgets.QMainWindow):
             self.refresh_table()
 
     def _find_next(self):
-        """Find next occurrence"""
-        self.status.showMessage("Find Next - Feature coming soon!", 2000)
+        """Find next occurrence (F3)"""
+        if not hasattr(self, 'table') or not self.table.model():
+            return
+        
+        current_row = self.table.currentIndex().row()
+        total_rows = self.table.model().rowCount()
+        
+        if total_rows == 0:
+            self.status.showMessage("No results to navigate", 2000)
+            return
+        
+        # Move to next row (wrap around)
+        next_row = (current_row + 1) % total_rows
+        self.table.selectRow(next_row)
+        self.table.scrollTo(self.table.model().index(next_row, 0))
+        self.status.showMessage(f"Result {next_row + 1} of {total_rows}", 2000)
 
     def _find_previous(self):
-        """Find previous occurrence"""
-        self.status.showMessage("Find Previous - Feature coming soon!", 2000)
+        """Find previous occurrence (Shift+F3)"""
+        if not hasattr(self, 'table') or not self.table.model():
+            return
+        
+        current_row = self.table.currentIndex().row()
+        total_rows = self.table.model().rowCount()
+        
+        if total_rows == 0:
+            self.status.showMessage("No results to navigate", 2000)
+            return
+        
+        # Move to previous row (wrap around)
+        prev_row = (current_row - 1) % total_rows
+        self.table.selectRow(prev_row)
+        self.table.scrollTo(self.table.model().index(prev_row, 0))
+        self.status.showMessage(f"Result {prev_row + 1} of {total_rows}", 2000)
 
     def _select_all(self):
         """Select all items in table"""
@@ -4063,47 +4625,56 @@ Built with PySide6 and modern UI design principles.
     
     def _start_geometry_compute(self):
         """Start geometry computation for selected files"""
-        selected = self.table.selectionModel().selectedRows()
-        if not selected:
-            QtWidgets.QMessageBox.information(self, "Compute Geometry", "Select one or more files first.")
-            return
-        
-        paths = []
-        for idx in selected:
-            row = self.model.rows[idx.row()]
-            if row and Path(row[0]).exists():
-                paths.append(row[0])
-        
-        if not paths:
-            QtWidgets.QMessageBox.information(self, "Compute Geometry", "No valid files selected.")
-            return
-        
-        self.status.showMessage(f"Computing geometry for {len(paths)} file(s)…")
-        worker = GeometryWorker(paths)
-        QtCore.QThreadPool.globalInstance().start(worker)
-        
-        # Quick refresh a bit later
-        QtCore.QTimer.singleShot(1500, self.refresh_table)
+        try:
+            selected = self.table.selectionModel().selectedRows()
+            if not selected:
+                QtWidgets.QMessageBox.information(self, "Compute Geometry", "Select one or more files first.")
+                return
+            
+            paths = []
+            for idx in selected:
+                row = self.model.rows[idx.row()]
+                if row and Path(row[0]).exists():
+                    paths.append(row[0])
+            
+            if not paths:
+                QtWidgets.QMessageBox.information(self, "Compute Geometry", "No valid files selected.")
+                return
+            
+            self.status.showMessage(f"Computing geometry for {len(paths)} file(s)…")
+            worker = GeometryWorker(paths)
+            QtCore.QThreadPool.globalInstance().start(worker)
+            
+            # Quick refresh a bit later
+            QtCore.QTimer.singleShot(1500, self.refresh_table)
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Geometry Compute Error", f"Failed to start geometry computation: {e}")
     
     def _rebuild_similarity_index(self): 
         """Rebuild similarity index"""
-        if not _SIM_AVAILABLE:
-            QtWidgets.QMessageBox.warning(
-                self, "Similarity Search",
-                "Similarity search requires additional libraries:\n\n"
-                "pip install numpy faiss-cpu scikit-learn joblib"
-            )
-            return
+        try:
+            if not _SIM_AVAILABLE:
+                QtWidgets.QMessageBox.warning(
+                    self, "Similarity Search",
+                    "Similarity search requires additional libraries:\n\n"
+                    "pip install numpy faiss-cpu scikit-learn joblib"
+                )
+                return
         
-        self.status.showMessage("Building similarity index...", 0)
-        QtWidgets.QApplication.processEvents()  # Update UI
-        
-        ok, msg = build_similarity_index()
-        if ok:
-            QtWidgets.QMessageBox.information(self, "Similarity Index", msg)
-            self.status.showMessage(msg, 5000)
-        else:
-            QtWidgets.QMessageBox.critical(self, "Similarity Index", f"Failed to build index:\n{msg}")
+            self.status.showMessage("Building similarity index...", 0)
+            QtWidgets.QApplication.processEvents()  # Update UI
+            
+            ok, msg = build_similarity_index()
+            if ok:
+                QtWidgets.QMessageBox.information(self, "Similarity Index", msg)
+                self.status.showMessage(msg, 5000)
+            else:
+                QtWidgets.QMessageBox.critical(self, "Similarity Index", f"Failed to build index:\n{msg}")
+                self.status.clearMessage()
+                
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Similarity Index Error", f"Failed to rebuild similarity index: {e}")
             self.status.clearMessage()
     
     def import_excel_dialog(self): 

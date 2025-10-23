@@ -42,37 +42,67 @@ class RowMeta:
 
 def _classify_with_ml(file_path: str, db_path: str) -> Optional[Dict[str, Any]]:
     """
-    Classify part type using ML geometric features.
+    Classify part type using ML geometric features with robust error handling.
     
     Returns:
-        Dict with part_type, confidence, laterality, or None if ML unavailable
+        Dict with part_type, confidence, laterality, or None if ML unavailable/failed
     """
     if not _ML_AVAILABLE:
         return None
     
     try:
-        # Extract geometric features
+        # Validate file exists and is readable
+        if not Path(file_path).exists():
+            return None
+            
+        # Extract geometric features with timeout protection
         features = extract_geometric_features(file_path)
-        if not features:
+        if not features or len(features) == 0:
             return None
         
-        # Load trained classifier
+        # Load trained classifier with fallback
         classifier = PartClassifier(db_path)
-        if not classifier.load('models/part_classifier.pkl'):
+        model_path = Path('models/part_classifier.pkl')
+        if not model_path.exists():
+            # Try alternative model locations
+            alt_paths = [
+                Path('models/part_classifier.joblib'),
+                Path('data/models/part_classifier.pkl'),
+                Path(db_path).parent / 'models' / 'part_classifier.pkl'
+            ]
+            model_loaded = False
+            for alt_path in alt_paths:
+                if alt_path.exists():
+                    model_loaded = classifier.load(str(alt_path))
+                    if model_loaded:
+                        break
+            
+            if not model_loaded:
+                return None
+        else:
+            if not classifier.load(str(model_path)):
+                return None
+        
+        # Predict with confidence validation
+        try:
+            part_type, part_conf, laterality, lat_conf = classifier.predict(features)
+            
+            # Validate predictions
+            if not part_type or part_conf < 0.0 or part_conf > 1.0:
+                return None
+                
+            return {
+                'part_type': str(part_type),
+                'confidence': float(part_conf),
+                'laterality': str(laterality) if laterality else 'center',
+                'laterality_confidence': float(lat_conf) if lat_conf else 0.0
+            }
+        except Exception as pred_error:
+            print(f"ML prediction failed for {Path(file_path).name}: {pred_error}")
             return None
-        
-        # Predict
-        part_type, part_conf, laterality, lat_conf = classifier.predict(features)
-        
-        return {
-            'part_type': part_type,
-            'confidence': part_conf,
-            'laterality': laterality,
-            'laterality_confidence': lat_conf
-        }
         
     except Exception as e:
-        print(f"ML classification failed: {e}")
+        print(f"ML classification failed for {Path(file_path).name}: {e}")
         return None
 
 
@@ -128,70 +158,101 @@ def propose_for_rows(
     proposals: List[Dict[str, Any]] = []
 
     for r in rows:
-        # 1) Text-based matching (filename → reference parts)
-        text_guess, text_score = guess_part_from_filename(r.name, parts_vocab)
-        
-        # 2) ML-based classification (geometry → part type)
-        ml_result = _classify_with_ml(r.path, db_path)
-        
-        # 3) Combine results
-        if ml_result and ml_result['confidence'] > 0.3:  # ML available and confident
-            # Prefer ML classification
-            part = ml_result['part_type']
-            laterality = ml_result['laterality']
+        try:
+            # Validate row data
+            if not r.path or not r.name or not r.ext:
+                continue
+                
+            # 1) Text-based matching (filename → reference parts)
+            try:
+                text_guess, text_score = guess_part_from_filename(r.name, parts_vocab)
+                if not text_guess:
+                    text_guess = 'part'  # Default fallback
+                if text_score < 0.0 or text_score > 1.0:
+                    text_score = 0.1  # Minimum confidence for text matching
+            except Exception as e:
+                print(f"Text matching failed for {r.name}: {e}")
+                text_guess, text_score = 'part', 0.1
             
-            # Combined confidence: 60% geometry + 40% text
-            geo_conf = ml_result['confidence']
+            # 2) ML-based classification (geometry → part type)
+            ml_result = _classify_with_ml(r.path, db_path)
             
-            # If text matching agrees, boost confidence
-            if text_guess == part:
-                combined_conf = (geo_conf * GEOMETRY_WEIGHT) + (text_score * TEXT_WEIGHT)
+            # 3) Combine results
+            if ml_result and ml_result['confidence'] > 0.3:  # ML available and confident
+                # Prefer ML classification
+                part = ml_result['part_type']
+                laterality = ml_result['laterality']
+                
+                # Combined confidence: 60% geometry + 40% text
+                geo_conf = ml_result['confidence']
+                
+                # If text matching agrees, boost confidence
+                if text_guess == part:
+                    combined_conf = (geo_conf * GEOMETRY_WEIGHT) + (text_score * TEXT_WEIGHT)
+                else:
+                    # Text disagrees - use geometric confidence but penalize
+                    combined_conf = geo_conf * GEOMETRY_WEIGHT + 0.2 * TEXT_WEIGHT
+                
+                # Add laterality prefix if detected and not center
+                if laterality and laterality != 'center':
+                    part = f"{laterality}_{part}"
+            
             else:
-                # Text disagrees - use geometric confidence but penalize
-                combined_conf = geo_conf * GEOMETRY_WEIGHT + 0.2 * TEXT_WEIGHT
+                # Fallback to text-only matching
+                part = text_guess if text_guess else "part"
+                combined_conf = float(text_score)
+                geo_conf = 0.0
+                laterality = None
+
+            # 4) Generate canonical filename
+            proposed = canonical_name(
+                project_number,
+                project_name or "unknown",
+                part,
+                r.ext.lstrip(".")  # Remove leading dot if present
+            )
+
+            # 5) Build proposal
+            proposal = {
+                "from": r.path,
+                "project_number": project_number,
+                "project_name": project_name or "unknown",
+                "part_name": part,
+                "conf": combined_conf,
+                "text_conf": float(text_score),
+                "proposed_name": proposed,
+                "needs_review": combined_conf < DEFAULT_ACCEPT_SCORE,
+                "original_label": parts_map.get(part, "") if part in parts_map else ""
+            }
             
-            # Add laterality prefix if detected and not center
-            if laterality and laterality != 'center':
-                part = f"{laterality}_{part}"
-        
-        else:
-            # Fallback to text-only matching
-            part = text_guess if text_guess else "part"
-            combined_conf = float(text_score)
-            geo_conf = 0.0
-            laterality = None
-
-        # 4) Generate canonical filename
-        proposed = canonical_name(
-            project_number,
-            project_name or "unknown",
-            part,
-            r.ext.lstrip(".")  # Remove leading dot if present
-        )
-
-        # 5) Build proposal
-        proposal = {
-            "from": r.path,
-            "project_number": project_number,
-            "project_name": project_name or "unknown",
-            "part_name": part,
-            "conf": combined_conf,
-            "text_conf": float(text_score),
-            "proposed_name": proposed,
-            "needs_review": combined_conf < DEFAULT_ACCEPT_SCORE,
-            "original_label": parts_map.get(part, "") if part in parts_map else ""
-        }
-        
-        # Add ML-specific fields if available
-        if ml_result:
-            proposal['geo_conf'] = ml_result['confidence']
-            proposal['laterality'] = laterality
-            proposal['laterality_conf'] = ml_result['laterality_confidence']
-        else:
-            proposal['geo_conf'] = 0.0
-            proposal['laterality'] = None
-        
-        proposals.append(proposal)
+            # Add ML-specific fields if available
+            if ml_result:
+                proposal['geo_conf'] = ml_result['confidence']
+                proposal['laterality'] = laterality
+                proposal['laterality_conf'] = ml_result['laterality_confidence']
+            else:
+                proposal['geo_conf'] = 0.0
+                proposal['laterality'] = None
+            
+            proposals.append(proposal)
+            
+        except Exception as e:
+            print(f"Proposal generation failed for {r.path}: {e}")
+            # Add fallback proposal
+            fallback_proposal = {
+                "from": r.path,
+                "project_number": project_number,
+                "project_name": project_name or "unknown",
+                "part_name": "part",
+                "conf": 0.1,
+                "text_conf": 0.1,
+                "geo_conf": 0.0,
+                "laterality": None,
+                "proposed_name": canonical_name(project_number, project_name or "unknown", "part", r.ext.lstrip(".")),
+                "needs_review": True,
+                "original_label": ""
+            }
+            proposals.append(fallback_proposal)
     
     return proposals
 

@@ -123,10 +123,26 @@ class PartClassifier:
         # Normalize features
         X_scaled = self.scaler.fit_transform(X)
         
-        # Split data
-        X_train, X_test, y_part_train, y_part_test, y_lat_train, y_lat_test = train_test_split(
-            X_scaled, y_part, y_lat, test_size=0.2, random_state=42, stratify=y_part
-        )
+        # Split data - handle small datasets
+        # Check if we have enough samples per class for stratified split
+        from collections import Counter
+        class_counts = Counter(y_part)
+        min_class_count = min(class_counts.values())
+        
+        if min_class_count < 2 or len(X) < 20:
+            # Too few samples - use all data for training, no test set
+            print("Warning: Limited training data - using all samples for training (no test set)")
+            X_train = X_scaled
+            X_test = X_scaled  # Use training set for evaluation
+            y_part_train = y_part
+            y_part_test = y_part
+            y_lat_train = y_lat
+            y_lat_test = y_lat
+        else:
+            # Enough samples - do proper train/test split with stratification
+            X_train, X_test, y_part_train, y_part_test, y_lat_train, y_lat_test = train_test_split(
+                X_scaled, y_part, y_lat, test_size=0.2, random_state=42, stratify=y_part
+            )
         
         # Train part type classifier
         print("\nTraining part type classifier...")

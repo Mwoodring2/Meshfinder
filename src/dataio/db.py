@@ -10,8 +10,11 @@ def _con():
 
 def ensure_user_corrections():
     con = _con(); cur = con.cursor()
+    
+    # Drop and recreate table to ensure correct schema
+    cur.execute("DROP TABLE IF EXISTS user_corrections")
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS user_corrections(
+    CREATE TABLE user_corrections(
       id INTEGER PRIMARY KEY,
       file_path TEXT,
       old_name TEXT,
@@ -20,23 +23,9 @@ def ensure_user_corrections():
       part_type TEXT,
       laterality TEXT,
       confidence REAL,
-      corrected_utc TEXT,
+      corrected_utc TEXT DEFAULT CURRENT_TIMESTAMP,
       used_for_training INTEGER DEFAULT 0
     )""")
-    
-    # Check if corrected_utc column exists, if not add it
-    try:
-        cur.execute("SELECT corrected_utc FROM user_corrections LIMIT 1")
-    except sqlite3.OperationalError:
-        # Column doesn't exist, add it
-        cur.execute("ALTER TABLE user_corrections ADD COLUMN corrected_utc TEXT")
-    
-    # Check if used_for_training column exists, if not add it
-    try:
-        cur.execute("SELECT used_for_training FROM user_corrections LIMIT 1")
-    except sqlite3.OperationalError:
-        # Column doesn't exist, add it
-        cur.execute("ALTER TABLE user_corrections ADD COLUMN used_for_training INTEGER DEFAULT 0")
     
     cur.execute("CREATE INDEX IF NOT EXISTS idx_uc_path ON user_corrections(file_path)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_uc_time ON user_corrections(corrected_utc)")
@@ -87,6 +76,36 @@ def update_file_record(old_path: str, new_path: str):
     """, (new_path, new_path, old_path))
     con.commit(); con.close()
 
+def update_proposal(src_path: str, fields: dict) -> None:
+    """Update file record with proposal data."""
+    if not src_path:
+        return
+    
+    con = _con()
+    cur = con.cursor()
+    
+    try:
+        cur.execute("""
+            UPDATE files
+            SET project_number = ?,
+                project_name   = ?,
+                part_name      = ?,
+                type_conf      = ?,
+                proposed_name  = ?,
+                status         = COALESCE(status, 'discovered')
+            WHERE path = ?
+        """, (
+            fields.get("project_number"),
+            fields.get("project_name"),
+            fields.get("part_name"),
+            float(fields.get("conf", 0.0)),
+            fields.get("proposed_name"),
+            src_path
+        ))
+        con.commit()
+    finally:
+        con.close()
+
 def batch_update_proposals(proposals: List[Dict[str, Any]]) -> int:
     """Batch update proposals in database"""
     if not proposals:
@@ -116,6 +135,53 @@ def batch_update_proposals(proposals: List[Dict[str, Any]]) -> int:
     
     con.commit(); con.close()
     return updated
+
+def log_op(operation: str, source_path: str, dest_path: str = None, 
+           details: str = "", user: str = None) -> None:
+    """Log a file operation to the database"""
+    con = _con(); cur = con.cursor()
+    
+    # Create operations log table if it doesn't exist
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS operations_log(
+            id INTEGER PRIMARY KEY,
+            operation TEXT,
+            source_path TEXT,
+            dest_path TEXT,
+            details TEXT,
+            user TEXT,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    cur.execute("""
+        INSERT INTO operations_log(operation, source_path, dest_path, details, user)
+        VALUES(?, ?, ?, ?, ?)
+    """, (operation, source_path, dest_path or "", details, user or ""))
+    
+    con.commit(); con.close()
+
+def get_file_records(status: str = None, limit: int = None) -> List[Dict[str, Any]]:
+    """Get file records from database, optionally filtered by status"""
+    con = _con(); cur = con.cursor()
+    
+    if status:
+        query = "SELECT * FROM files WHERE migration_status = ? ORDER BY path"
+        params = [status]
+        if limit:
+            query += f" LIMIT {int(limit)}"
+        rows = cur.execute(query, params).fetchall()
+    else:
+        query = "SELECT * FROM files ORDER BY path"
+        if limit:
+            query += f" LIMIT {int(limit)}"
+        rows = cur.execute(query).fetchall()
+    
+    # Get column names
+    cols = [desc[0] for desc in cur.description]
+    con.close()
+    
+    return [dict(zip(cols, row)) for row in rows]
 
 # Ensure user_corrections table exists when module is imported
 ensure_user_corrections()

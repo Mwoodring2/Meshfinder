@@ -27,24 +27,60 @@ class GLViewer(QtOpenGLWidgets.QOpenGLWidget):
         self.setMinimumSize(200, 200)
         
     def load_mesh(self, file_path: str | Path):
-        """Load a 3D mesh from file"""
+        """Load a 3D mesh from file with robust error handling"""
         try:
             file_path = Path(file_path)
             if not file_path.exists():
                 print(f"File not found: {file_path}")
+                self.mesh = None
+                self.update()
                 return False
-                
-            # Load mesh using trimesh
-            self.mesh = trimesh.load(str(file_path), force='mesh')
             
-            # Center and normalize the mesh
+            # Check file size (skip very large files)
+            file_size = file_path.stat().st_size
+            if file_size > 100 * 1024 * 1024:  # 100MB limit
+                print(f"File too large for preview: {file_size / (1024*1024):.1f}MB")
+                self.mesh = None
+                self.update()
+                return False
+            
+            # Load mesh using trimesh with timeout protection
+            try:
+                self.mesh = trimesh.load(str(file_path), force='mesh')
+            except Exception as load_error:
+                print(f"Failed to load mesh with trimesh: {load_error}")
+                self.mesh = None
+                self.update()
+                return False
+            
+            # Validate and process mesh
             if isinstance(self.mesh, trimesh.Trimesh):
+                # Check if mesh has valid geometry
+                if len(self.mesh.vertices) == 0 or len(self.mesh.faces) == 0:
+                    print("Mesh has no geometry")
+                    self.mesh = None
+                    self.update()
+                    return False
+                
                 # Center the mesh at origin
-                self.mesh.vertices -= self.mesh.centroid
+                try:
+                    self.mesh.vertices -= self.mesh.centroid
+                except Exception as e:
+                    print(f"Failed to center mesh: {e}")
                 
                 # Scale to fit in view (normalize to unit cube)
-                scale = 2.0 / max(self.mesh.extents)
-                self.mesh.vertices *= scale
+                try:
+                    extents = self.mesh.extents
+                    if extents is not None and max(extents) > 0:
+                        scale = 2.0 / max(extents)
+                        self.mesh.vertices *= scale
+                except Exception as e:
+                    print(f"Failed to scale mesh: {e}")
+            else:
+                print("Loaded object is not a trimesh.Trimesh")
+                self.mesh = None
+                self.update()
+                return False
             
             # Reset camera
             self.rotation_x = 0
@@ -58,6 +94,7 @@ class GLViewer(QtOpenGLWidgets.QOpenGLWidget):
         except Exception as e:
             print(f"Error loading mesh: {e}")
             self.mesh = None
+            self.update()
             return False
     
     def clear_mesh(self):

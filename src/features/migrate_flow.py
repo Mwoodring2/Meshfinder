@@ -44,72 +44,124 @@ class MigrationGuardrails:
         Returns:
             Dictionary with migration plan and conflicts
         """
+        # Validate inputs
+        if not source_files:
+            return {
+                'plan': [], 'conflicts': [], 'quarantined': [],
+                'ready_count': 0, 'conflict_count': 0, 'quarantined_count': 0,
+                'error': 'No source files provided'
+            }
+        
+        if not dest_root or not Path(dest_root).exists():
+            return {
+                'plan': [], 'conflicts': [], 'quarantined': [],
+                'ready_count': 0, 'conflict_count': 0, 'quarantined_count': 0,
+                'error': f'Destination root does not exist: {dest_root}'
+            }
+        
         plan = []
         conflicts = []
         quarantined = []
         
         for source_file in source_files:
-            source_path = Path(source_file)
-            
-            # Skip if file doesn't exist
-            if not source_path.exists():
-                conflicts.append({
-                    'file': source_file,
-                    'type': 'missing_file',
-                    'message': 'Source file does not exist'
-                })
-                continue
-            
-            # Check if file is quarantined
-            if self.mesh_validator.is_quarantined(source_file):
-                quarantined.append({
-                    'file': source_file,
-                    'reason': 'File is quarantined due to malformed mesh'
-                })
-                continue
-            
-            # Validate mesh if it's a 3D file
-            if source_path.suffix.lower() in ['.stl', '.obj', '.ply', '.off']:
-                is_valid, error_reason, validation_details = self.mesh_validator.validate_mesh(source_file)
-                if not is_valid:
-                    # Quarantine the malformed mesh
-                    self.mesh_validator.quarantine_mesh(
-                        source_file, 
-                        error_reason, 
-                        str(validation_details)
-                    )
-                    quarantined.append({
+            try:
+                source_path = Path(source_file)
+                
+                # Skip if file doesn't exist
+                if not source_path.exists():
+                    conflicts.append({
                         'file': source_file,
-                        'reason': f'Malformed mesh: {error_reason}',
-                        'details': validation_details
+                        'type': 'missing_file',
+                        'message': 'Source file does not exist'
                     })
                     continue
-            
-            # Generate destination path
-            dest_path = self._generate_dest_path(
-                source_path, dest_root, project_number, license_type, asset_category
-            )
-            
-            # Check for conflicts
-            conflict_type, conflict_message = self._check_dest_conflict(source_path, dest_path)
-            
-            if conflict_type:
+                
+                # Skip if it's a directory
+                if source_path.is_dir():
+                    conflicts.append({
+                        'file': source_file,
+                        'type': 'is_directory',
+                        'message': 'Source is a directory, not a file'
+                    })
+                    continue
+                
+                # Check file size (skip empty files)
+                try:
+                    file_size = source_path.stat().st_size
+                    if file_size == 0:
+                        conflicts.append({
+                            'file': source_file,
+                            'type': 'empty_file',
+                            'message': 'Source file is empty'
+                        })
+                        continue
+                except OSError as e:
+                    conflicts.append({
+                        'file': source_file,
+                        'type': 'access_error',
+                        'message': f'Cannot access file: {e}'
+                    })
+                    continue
+                
+                # Check if file is quarantined
+                if self.mesh_validator.is_quarantined(source_file):
+                    quarantined.append({
+                        'file': source_file,
+                        'reason': 'File is quarantined due to malformed mesh'
+                    })
+                    continue
+                
+                # Validate mesh if it's a 3D file
+                if source_path.suffix.lower() in ['.stl', '.obj', '.ply', '.off']:
+                    is_valid, error_reason, validation_details = self.mesh_validator.validate_mesh(source_file)
+                    if not is_valid:
+                        # Quarantine the malformed mesh
+                        self.mesh_validator.quarantine_mesh(
+                            source_file, 
+                            error_reason, 
+                            str(validation_details)
+                        )
+                        quarantined.append({
+                            'file': source_file,
+                            'reason': f'Malformed mesh: {error_reason}',
+                            'details': validation_details
+                        })
+                        continue
+                
+                # Generate destination path
+                dest_path = self._generate_dest_path(
+                    source_path, dest_root, project_number, license_type, asset_category
+                )
+                
+                # Check for conflicts
+                conflict_type, conflict_message = self._check_dest_conflict(source_path, dest_path)
+                
+                if conflict_type:
+                    conflicts.append({
+                        'file': source_file,
+                        'dest': str(dest_path),
+                        'type': conflict_type,
+                        'message': conflict_message
+                    })
+                
+                # Add to plan
+                plan.append({
+                    'source': source_file,
+                    'dest': str(dest_path),
+                    'status': 'Ready' if not conflict_type else 'Conflict',
+                    'conflict_type': conflict_type,
+                    'file_size': file_size,
+                    'sha256': self.integrity_checker.calculate_file_hash(source_file)
+                })
+                
+            except Exception as e:
+                # Handle any unexpected errors during planning
                 conflicts.append({
                     'file': source_file,
-                    'dest': str(dest_path),
-                    'type': conflict_type,
-                    'message': conflict_message
+                    'type': 'planning_error',
+                    'message': f'Error during planning: {e}'
                 })
-            
-            # Add to plan
-            plan.append({
-                'source': source_file,
-                'dest': str(dest_path),
-                'status': 'Ready' if not conflict_type else 'Conflict',
-                'conflict_type': conflict_type,
-                'file_size': source_path.stat().st_size,
-                'sha256': self.integrity_checker.calculate_file_hash(source_file)
-            })
+                continue
         
         return {
             'plan': plan,
