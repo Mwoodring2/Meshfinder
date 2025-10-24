@@ -661,8 +661,15 @@ class ThumbnailGenWorker(QtCore.QRunnable):
             from PIL.ImageQt import ImageQt
             
             # Generate high-quality isometric preview using solid_renderer
-            # Use conservative face limit for thumbnails to ensure fast generation
-            max_faces = 50000 if self.size <= 256 else 100000
+            # Use conservative face limits for very large files (200-300MB+)
+            # Check file size to determine appropriate face limit
+            file_size_mb = Path(self.file_path).stat().st_size / (1024 * 1024)
+            if file_size_mb > 200:  # Very large files (200MB+)
+                max_faces = 30000 if self.size <= 256 else 50000
+            elif file_size_mb > 100:  # Large files (100-200MB)
+                max_faces = 50000 if self.size <= 256 else 100000
+            else:  # Normal files
+                max_faces = 100000 if self.size <= 256 else 150000
             
             img = render_mesh_to_image(
                 file_path=self.file_path, 
@@ -681,6 +688,9 @@ class ThumbnailGenWorker(QtCore.QRunnable):
             
             if not pm.isNull():
                 self.cache.save_thumbnail(self.file_path, pm)
+                # Show file size and face limit in status for large files
+                if file_size_mb > 100:
+                    print(f"Generated thumbnail for {Path(self.file_path).name}: {file_size_mb:.1f}MB, max_faces={max_faces}")
                 
         except ImportError:
             # Fallback to original method if solid_renderer not available
@@ -3625,8 +3635,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status.showMessage("Generating large preview...", 3000)
             
             # Create a larger preview (512x512) with optimized settings for large files
-            # Use conservative face limit for very large files (200-300 MB)
-            max_faces = 150000  # Recommended limit for large files
+            # Check file size to determine appropriate face limit for large preview
+            file_size_mb = Path(self.current_preview_file).stat().st_size / (1024 * 1024)
+            if file_size_mb > 200:  # Very large files (200MB+) - very conservative
+                max_faces = 75000
+            elif file_size_mb > 100:  # Large files (100-200MB)
+                max_faces = 100000
+            else:  # Normal files
+                max_faces = 150000
             
             img = render_mesh_to_image(
                 file_path=self.current_preview_file,
@@ -3671,7 +3687,11 @@ class MainWindow(QtWidgets.QMainWindow):
             layout.addLayout(button_layout)
             
             preview_window.show()
-            self.status.showMessage("Large preview generated", 2000)
+            # Show file size and face limit for large files
+            if file_size_mb > 100:
+                self.status.showMessage(f"Large preview generated ({file_size_mb:.1f}MB, {max_faces} faces)", 3000)
+            else:
+                self.status.showMessage("Large preview generated", 2000)
             
         except ImportError:
             QtWidgets.QMessageBox.warning(self, "Solid Renderer Not Available", 
