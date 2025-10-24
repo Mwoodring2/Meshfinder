@@ -651,14 +651,48 @@ class ThumbnailGenWorker(QtCore.QRunnable):
         self.size = size
 
     def run(self):
-        """Generate thumbnail using trimesh with fallback methods"""
+        """Generate thumbnail using solid_renderer with fallback methods"""
         if not _GEO_AVAILABLE or not _PIL_AVAILABLE:
             return
         
         try:
+            # Use the new solid_renderer for clean, professional 3D previews
+            from solid_renderer import render_mesh_to_image
+            from PIL.ImageQt import ImageQt
+            
+            # Generate high-quality isometric preview using solid_renderer
+            img = render_mesh_to_image(
+                file_path=self.file_path, 
+                size=(self.size, self.size),
+                bg_rgba=(245, 245, 245, 255),  # Clean white background
+                face_rgb=(220, 220, 240),      # Light blue-gray for mesh
+                outline_rgb=(160, 160, 180),   # Subtle edge outlines
+                outline_width=1,
+                max_faces=50000,               # Reasonable limit for thumbnails
+                draw_edges=True
+            )
+            
+            # Convert PIL Image to QPixmap using ImageQt
+            qimage = ImageQt(img)
+            pm = QtGui.QPixmap.fromImage(qimage)
+            
+            if not pm.isNull():
+                self.cache.save_thumbnail(self.file_path, pm)
+                
+        except ImportError:
+            # Fallback to original method if solid_renderer not available
+            self._fallback_render()
+        except Exception as e:
+            # Silently fail - thumbnail generation is optional
+            print(f"Thumbnail generation failed for {self.file_path}: {e}")
+            pass
+    
+    def _fallback_render(self):
+        """Fallback rendering method using the original implementation"""
+        try:
             import trimesh
             import numpy as np
-            from PIL import Image, ImageDraw, ImageFont
+            from PIL import Image, ImageDraw
             
             # Load mesh - Force Trimesh to return a triangular mesh
             m = trimesh.load(self.file_path, force='mesh', process=True)
@@ -699,9 +733,6 @@ class ThumbnailGenWorker(QtCore.QRunnable):
             except Exception as e:
                 print(f"Warning: Mesh auto-correction failed for {self.file_path}: {e}")
                 # Continue with rendering even if auto-correction fails
-            
-            # Skip trimesh scene rendering - use our custom solid mesh renderer instead
-            # This ensures we get clean solid mesh previews instead of point clouds
             
             # Create a clean, solid mesh preview like Windows File Explorer
             img = Image.new('RGB', (self.size, self.size), color=(245, 245, 245))  # Clean white background
@@ -818,7 +849,7 @@ class ThumbnailGenWorker(QtCore.QRunnable):
                 
         except Exception as e:
             # Silently fail - thumbnail generation is optional
-            print(f"Thumbnail generation failed for {self.file_path}: {e}")
+            print(f"Fallback thumbnail generation failed for {self.file_path}: {e}")
             pass
 
 # -----------------------------
@@ -3486,6 +3517,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.current_preview_file: return
         m = QtWidgets.QMenu(self.preview_thumbnail)
         m.addAction("🖼️ Generate Thumbnail", self._generate_thumbnail)
+        
+        # Add large preview option for 3D files
+        ext = Path(self.current_preview_file).suffix.lower()
+        if ext in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
+            m.addAction("🔍 Large Preview", self._generate_large_preview)
+        
         m.addAction("🗑️ Clear Thumbnail Cache", self._clear_thumbnail_cache)
         m.addSeparator()
         m.addAction("🔧 Open in External Viewer", self._open_in_external_viewer)
@@ -3556,6 +3593,108 @@ class MainWindow(QtWidgets.QMainWindow):
             
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Thumbnail Error", f"Failed to generate thumbnail: {e}")
+
+    def _generate_large_preview(self):
+        """Generate a large preview image using solid_renderer"""
+        try:
+            if not self.current_preview_file:
+                QtWidgets.QMessageBox.warning(self, "No File Selected", 
+                    "No file is currently selected for preview.")
+                return
+            
+            if not Path(self.current_preview_file).exists():
+                QtWidgets.QMessageBox.warning(self, "File Not Found", 
+                    "Selected file no longer exists.")
+                return
+            
+            # Check if it's a 3D file
+            ext = Path(self.current_preview_file).suffix.lower()
+            if ext not in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
+                QtWidgets.QMessageBox.information(self, "Not a 3D File", 
+                    "Large preview is only available for 3D model files.")
+                return
+            
+            # Generate large preview using solid_renderer
+            from solid_renderer import render_mesh_to_image
+            from PIL.ImageQt import ImageQt
+            
+            self.status.showMessage("Generating large preview...", 3000)
+            
+            # Create a larger preview (512x512 or 768x768)
+            img = render_mesh_to_image(
+                file_path=self.current_preview_file,
+                size=(512, 512),
+                bg_rgba=(245, 245, 245, 255),  # Clean white background
+                face_rgb=(220, 220, 240),      # Light blue-gray for mesh
+                outline_rgb=(160, 160, 180),   # Subtle edge outlines
+                outline_width=1,
+                max_faces=100000,              # Higher limit for large preview
+                draw_edges=True
+            )
+            
+            # Convert to QPixmap and display in a new window
+            qimage = ImageQt(img)
+            pixmap = QtGui.QPixmap.fromImage(qimage)
+            
+            # Create preview window
+            preview_window = QtWidgets.QDialog(self)
+            preview_window.setWindowTitle(f"3D Preview - {Path(self.current_preview_file).name}")
+            preview_window.setModal(False)
+            preview_window.resize(600, 600)
+            
+            layout = QtWidgets.QVBoxLayout(preview_window)
+            
+            # Add image label
+            image_label = QtWidgets.QLabel()
+            image_label.setPixmap(pixmap.scaled(512, 512, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+            image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(image_label)
+            
+            # Add buttons
+            button_layout = QtWidgets.QHBoxLayout()
+            
+            save_btn = QtWidgets.QPushButton("Save Image...")
+            save_btn.clicked.connect(lambda: self._save_preview_image(img, preview_window))
+            button_layout.addWidget(save_btn)
+            
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.clicked.connect(preview_window.close)
+            button_layout.addWidget(close_btn)
+            
+            layout.addLayout(button_layout)
+            
+            preview_window.show()
+            self.status.showMessage("Large preview generated", 2000)
+            
+        except ImportError:
+            QtWidgets.QMessageBox.warning(self, "Solid Renderer Not Available", 
+                "The solid_renderer module is not available. Please ensure it's installed.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Preview Error", f"Failed to generate large preview: {e}")
+
+    def _save_preview_image(self, img, parent_window):
+        """Save the preview image to a file"""
+        try:
+            from pathlib import Path
+            
+            # Get default filename
+            base_name = Path(self.current_preview_file).stem
+            default_filename = f"{base_name}_preview.png"
+            
+            # Open save dialog
+            filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+                parent_window,
+                "Save Preview Image",
+                default_filename,
+                "PNG Images (*.png);;JPEG Images (*.jpg);;All Files (*)"
+            )
+            
+            if filename:
+                img.save(filename)
+                self.status.showMessage(f"Preview saved to {filename}", 3000)
+                
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(parent_window, "Save Error", f"Failed to save image: {e}")
 
     def _open_in_explorer(self):
         """Open selected file in Windows Explorer"""
