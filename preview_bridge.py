@@ -3,10 +3,15 @@
 from pathlib import Path
 from typing import Optional, Tuple
 
-def render_preview_qpixmap(file_path: str, size: Tuple[int, int] = (384, 384)):
+def render_preview_qpixmap(file_path: str, size: Tuple[int, int] = (384, 384), debug_force_hull: bool = False):
     """
     Safe preview entrypoint for huge STL/OBJ.
     Returns (QPixmap | None, stats: dict).
+    
+    Args:
+        file_path: Path to 3D file
+        size: Preview dimensions
+        debug_force_hull: If True, force convex hull to detect degenerate/self-intersecting source
     """
     import json
     import numpy as np
@@ -51,8 +56,25 @@ def render_preview_qpixmap(file_path: str, size: Tuple[int, int] = (384, 384)):
 
     # ---- 2) Render shaded isometric via PIL (robust to big/dirty meshes)
     try:
-        # Tune face cap for large files; 120–180k gives good detail vs speed
-        img = render_mesh_to_image(file_path, size=size, max_faces=150_000)
+        # Determine face cap based on file size to prevent memory/CPU thrash
+        file_size_mb = Path(file_path).stat().st_size / (1024 * 1024)
+        if file_size_mb > 200:  # Very large files (200MB+) - very conservative
+            max_faces = 90_000
+            stats["notes"].append(f"Large file ({file_size_mb:.1f}MB): using conservative {max_faces:,} face limit")
+        elif file_size_mb > 100:  # Large files (100-200MB)
+            max_faces = 120_000
+        else:  # Normal files
+            max_faces = 150_000
+        
+        if debug_force_hull:
+            # Debug mode: Force convex hull to detect degenerate/self-intersecting source
+            stats["notes"].append("DEBUG: Forcing convex hull")
+            mesh = mesh.convex_hull
+            img = render_mesh_to_image(mesh, size=size, max_faces=max_faces)
+        else:
+            # Normal mode: Use file path directly
+            img = render_mesh_to_image(file_path, size=size, max_faces=max_faces)
+        
         qimage = ImageQt(img)   # PIL → QImage
         pixmap = QtGui.QPixmap.fromImage(qimage)
         return pixmap, stats

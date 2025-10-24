@@ -3626,6 +3626,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if ext in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
             m.addAction("🔍 Large Preview", self._generate_large_preview)
             m.addAction("🐛 Debug Preview", self._debug_preview)
+            m.addAction("🔧 Debug Hull Preview", self._debug_hull_preview)
             m.addAction("📊 Mesh Analysis", self._analyze_mesh)
         
         m.addAction("🗑️ Clear Thumbnail Cache", self._clear_thumbnail_cache)
@@ -3940,6 +3941,115 @@ class MainWindow(QtWidgets.QMainWindow):
                     
         except Exception as e:
             QtWidgets.QMessageBox.critical(parent_window, "Debug Hull Error", f"Failed to generate hull preview: {e}")
+
+    def _debug_hull_preview(self):
+        """Debug preview with forced convex hull to detect degenerate geometry"""
+        try:
+            if not self.current_preview_file:
+                QtWidgets.QMessageBox.warning(self, "No File Selected", 
+                    "No file is currently selected for preview.")
+                return
+            
+            if not Path(self.current_preview_file).exists():
+                QtWidgets.QMessageBox.warning(self, "File Not Found", 
+                    "Selected file no longer exists.")
+                return
+            
+            # Check if it's a 3D file
+            ext = Path(self.current_preview_file).suffix.lower()
+            if ext not in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
+                QtWidgets.QMessageBox.information(self, "Not a 3D File", 
+                    "Debug hull preview is only available for 3D model files.")
+                return
+            
+            from preview_bridge import render_preview_qpixmap
+            from PIL.ImageQt import ImageQt
+            
+            self.status.showMessage("Generating debug hull preview...", 3000)
+            
+            # Force convex hull to detect degenerate/self-intersecting source
+            pix, stats = render_preview_qpixmap(
+                self.current_preview_file, 
+                size=(512, 512), 
+                debug_force_hull=True
+            )
+            
+            if pix:
+                # Create debug hull preview window
+                debug_window = QtWidgets.QDialog(self)
+                debug_window.setWindowTitle(f"Debug Hull Preview - {Path(self.current_preview_file).name}")
+                debug_window.setModal(False)
+                debug_window.resize(700, 700)
+                
+                layout = QtWidgets.QVBoxLayout(debug_window)
+                
+                # Add debug info
+                info_label = QtWidgets.QLabel("Debug Mode: Forced Convex Hull")
+                info_label.setStyleSheet("font-weight: bold; color: #ff6b6b;")
+                layout.addWidget(info_label)
+                
+                # Show stats
+                if stats.get('faces'):
+                    stats_label = QtWidgets.QLabel(f"Faces: {stats['faces']:,} | Vertices: {stats.get('vertices', 0):,}")
+                    layout.addWidget(stats_label)
+                
+                # Add image label
+                image_label = QtWidgets.QLabel()
+                image_label.setPixmap(pix.scaled(512, 512, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+                image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(image_label)
+                
+                # Add notes
+                if stats.get('notes'):
+                    notes_text = QtWidgets.QTextEdit()
+                    notes_text.setReadOnly(True)
+                    notes_text.setMaximumHeight(100)
+                    notes_text.setPlainText("Notes:\n" + "\n".join(stats['notes']))
+                    layout.addWidget(notes_text)
+                
+                # Add buttons
+                button_layout = QtWidgets.QHBoxLayout()
+                
+                save_btn = QtWidgets.QPushButton("Save Image...")
+                save_btn.clicked.connect(lambda: self._save_debug_image(pix, debug_window))
+                button_layout.addWidget(save_btn)
+                
+                close_btn = QtWidgets.QPushButton("Close")
+                close_btn.clicked.connect(debug_window.close)
+                button_layout.addWidget(close_btn)
+                
+                layout.addLayout(button_layout)
+                
+                debug_window.show()
+                self.status.showMessage("Debug hull preview generated", 2000)
+            else:
+                # Show error message with notes
+                notes = stats.get('notes', ['Unknown error'])
+                QtWidgets.QMessageBox.warning(self, "Debug Hull Preview Failed", 
+                    f"Failed to generate hull preview:\n{'; '.join(notes[:3])}")
+            
+        except ImportError:
+            QtWidgets.QMessageBox.warning(self, "Preview Bridge Not Available", 
+                "The preview_bridge module is not available. Please ensure it's installed.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Debug Hull Preview Error", f"Failed to generate debug hull preview: {e}")
+
+    def _save_debug_image(self, pixmap, parent_window):
+        """Save the debug image to a file"""
+        try:
+            filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+                parent_window,
+                "Save Debug Image",
+                f"{Path(self.current_preview_file).stem}_debug_hull.png",
+                "PNG Images (*.png);;JPEG Images (*.jpg);;All Files (*)"
+            )
+            
+            if filename:
+                pixmap.save(filename)
+                self.status.showMessage(f"Debug image saved to {filename}", 3000)
+                
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(parent_window, "Save Error", f"Failed to save debug image: {e}")
 
     def _analyze_mesh(self):
         """Analyze mesh using mesh_probe.py and show detailed report"""
