@@ -661,6 +661,9 @@ class ThumbnailGenWorker(QtCore.QRunnable):
             from PIL.ImageQt import ImageQt
             
             # Generate high-quality isometric preview using solid_renderer
+            # Use conservative face limit for thumbnails to ensure fast generation
+            max_faces = 50000 if self.size <= 256 else 100000
+            
             img = render_mesh_to_image(
                 file_path=self.file_path, 
                 size=(self.size, self.size),
@@ -668,7 +671,7 @@ class ThumbnailGenWorker(QtCore.QRunnable):
                 face_rgb=(220, 220, 240),      # Light blue-gray for mesh
                 outline_rgb=(160, 160, 180),   # Subtle edge outlines
                 outline_width=1,
-                max_faces=50000,               # Reasonable limit for thumbnails
+                max_faces=max_faces,           # Adaptive limit based on size
                 draw_edges=True
             )
             
@@ -3522,6 +3525,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ext = Path(self.current_preview_file).suffix.lower()
         if ext in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
             m.addAction("🔍 Large Preview", self._generate_large_preview)
+            m.addAction("🐛 Debug Preview", self._debug_preview)
         
         m.addAction("🗑️ Clear Thumbnail Cache", self._clear_thumbnail_cache)
         m.addSeparator()
@@ -3620,7 +3624,10 @@ class MainWindow(QtWidgets.QMainWindow):
             
             self.status.showMessage("Generating large preview...", 3000)
             
-            # Create a larger preview (512x512 or 768x768)
+            # Create a larger preview (512x512) with optimized settings for large files
+            # Use conservative face limit for very large files (200-300 MB)
+            max_faces = 150000  # Recommended limit for large files
+            
             img = render_mesh_to_image(
                 file_path=self.current_preview_file,
                 size=(512, 512),
@@ -3628,7 +3635,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 face_rgb=(220, 220, 240),      # Light blue-gray for mesh
                 outline_rgb=(160, 160, 180),   # Subtle edge outlines
                 outline_width=1,
-                max_faces=100000,              # Higher limit for large preview
+                max_faces=max_faces,           # Optimized for large files
                 draw_edges=True
             )
             
@@ -3695,6 +3702,133 @@ class MainWindow(QtWidgets.QMainWindow):
                 
         except Exception as e:
             QtWidgets.QMessageBox.critical(parent_window, "Save Error", f"Failed to save image: {e}")
+
+    def _debug_preview(self):
+        """Debug preview generation with diagnostic options"""
+        try:
+            if not self.current_preview_file:
+                QtWidgets.QMessageBox.warning(self, "No File Selected", 
+                    "No file is currently selected for preview.")
+                return
+            
+            if not Path(self.current_preview_file).exists():
+                QtWidgets.QMessageBox.warning(self, "File Not Found", 
+                    "Selected file no longer exists.")
+                return
+            
+            # Check if it's a 3D file
+            ext = Path(self.current_preview_file).suffix.lower()
+            if ext not in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
+                QtWidgets.QMessageBox.information(self, "Not a 3D File", 
+                    "Debug preview is only available for 3D model files.")
+                return
+            
+            from solid_renderer import render_mesh_to_image
+            from PIL.ImageQt import ImageQt
+            
+            self.status.showMessage("Generating debug preview...", 3000)
+            
+            # Create debug preview with diagnostic options
+            img = render_mesh_to_image(
+                file_path=self.current_preview_file,
+                size=(512, 512),
+                bg_rgba=(245, 245, 245, 255),
+                face_rgb=(220, 220, 240),
+                outline_rgb=(160, 160, 180),
+                outline_width=1,
+                max_faces=150000,
+                draw_edges=True,
+                debug_no_downsample=True,  # Disable downsampling to see full mesh
+                debug_force_hull=False    # Set to True to force convex hull
+            )
+            
+            # Convert to QPixmap and display in a new window
+            qimage = ImageQt(img)
+            pixmap = QtGui.QPixmap.fromImage(qimage)
+            
+            # Create debug preview window
+            debug_window = QtWidgets.QDialog(self)
+            debug_window.setWindowTitle(f"Debug Preview - {Path(self.current_preview_file).name}")
+            debug_window.setModal(False)
+            debug_window.resize(700, 700)
+            
+            layout = QtWidgets.QVBoxLayout(debug_window)
+            
+            # Add debug info
+            info_label = QtWidgets.QLabel("Debug Mode: No downsampling enabled")
+            info_label.setStyleSheet("font-weight: bold; color: #ff6b6b;")
+            layout.addWidget(info_label)
+            
+            # Add image label
+            image_label = QtWidgets.QLabel()
+            image_label.setPixmap(pixmap.scaled(512, 512, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+            image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(image_label)
+            
+            # Add debug buttons
+            button_layout = QtWidgets.QHBoxLayout()
+            
+            hull_btn = QtWidgets.QPushButton("Force Convex Hull")
+            hull_btn.clicked.connect(lambda: self._debug_with_hull(debug_window))
+            button_layout.addWidget(hull_btn)
+            
+            save_btn = QtWidgets.QPushButton("Save Image...")
+            save_btn.clicked.connect(lambda: self._save_preview_image(img, debug_window))
+            button_layout.addWidget(save_btn)
+            
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.clicked.connect(debug_window.close)
+            button_layout.addWidget(close_btn)
+            
+            layout.addLayout(button_layout)
+            
+            debug_window.show()
+            self.status.showMessage("Debug preview generated", 2000)
+            
+        except ImportError:
+            QtWidgets.QMessageBox.warning(self, "Solid Renderer Not Available", 
+                "The solid_renderer module is not available. Please ensure it's installed.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Debug Preview Error", f"Failed to generate debug preview: {e}")
+
+    def _debug_with_hull(self, parent_window):
+        """Generate debug preview with forced convex hull"""
+        try:
+            from solid_renderer import render_mesh_to_image
+            from PIL.ImageQt import ImageQt
+            
+            # Force convex hull to rule out degenerate geometry
+            img = render_mesh_to_image(
+                file_path=self.current_preview_file,
+                size=(512, 512),
+                bg_rgba=(245, 245, 245, 255),
+                face_rgb=(220, 220, 240),
+                outline_rgb=(160, 160, 180),
+                outline_width=1,
+                max_faces=150000,
+                draw_edges=True,
+                debug_no_downsample=True,
+                debug_force_hull=True  # Force convex hull
+            )
+            
+            # Update the preview in the same window
+            qimage = ImageQt(img)
+            pixmap = QtGui.QPixmap.fromImage(qimage)
+            
+            # Find and update the image label
+            for child in parent_window.findChildren(QtWidgets.QLabel):
+                if child.pixmap() is not None:
+                    child.setPixmap(pixmap.scaled(512, 512, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+                    break
+            
+            # Update info label
+            for child in parent_window.findChildren(QtWidgets.QLabel):
+                if "Debug Mode" in child.text():
+                    child.setText("Debug Mode: Forced convex hull (no downsampling)")
+                    break
+                    
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(parent_window, "Debug Hull Error", f"Failed to generate hull preview: {e}")
 
     def _open_in_explorer(self):
         """Open selected file in Windows Explorer"""

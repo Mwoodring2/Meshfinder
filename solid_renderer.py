@@ -1,256 +1,199 @@
-# solid_renderer.py
-# Clean, shaded 3D previews using PIL + NumPy + trimesh (no OpenGL).
-# Usage:
-#   from solid_renderer import render_mesh_to_image
-#   img = render_mesh_to_image("E:/models/thing.stl", size=(512,512))
-#   img.save("preview.png")
-
+# solid_renderer.py (v2) – resilient PIL renderer for big/dirty meshes
 from __future__ import annotations
-import math
 from pathlib import Path
 from typing import Tuple, Optional
-
-import numpy as np
+import math, numpy as np
 from PIL import Image, ImageDraw
 import trimesh
 
-
-# --------------------------- projection helpers ---------------------------
+# ---------------- basics ----------------
 
 def _iso_matrix() -> np.ndarray:
-    """
-    Classic isometric: rotate around Z by 45°, then around X by ~35.264° (arctan(sin/sqrt(2))).
-    Returns 3x3 rotation matrix.
-    """
     rz = math.radians(45.0)
     rx = math.radians(35.26438968)
-    Rz = np.array([
-        [ math.cos(rz), -math.sin(rz), 0.0],
-        [ math.sin(rz),  math.cos(rz), 0.0],
-        [          0.0,           0.0, 1.0],
-    ], dtype=np.float32)
-    Rx = np.array([
-        [1.0,          0.0,           0.0],
-        [0.0, math.cos(rx), -math.sin(rx)],
-        [0.0, math.sin(rx),  math.cos(rx)],
-    ], dtype=np.float32)
+    Rz = np.array([[math.cos(rz),-math.sin(rz),0],
+                   [math.sin(rz), math.cos(rz),0],
+                   [0,0,1]], dtype=np.float32)
+    Rx = np.array([[1,0,0],
+                   [0, math.cos(rx),-math.sin(rx)],
+                   [0, math.sin(rx), math.cos(rx)]], dtype=np.float32)
     return Rx @ Rz
 
+def _project_iso(verts: np.ndarray) -> np.ndarray:
+    R = _iso_matrix()
+    return (verts.astype(np.float32) @ R.T)
 
-def _fit_to_canvas(verts: np.ndarray, size: Tuple[int, int], margin_px: int = 16) -> Tuple[np.ndarray, float, np.ndarray]:
-    """
-    Normalizes and scales 3D verts (already rotated) to fit the target image size.
-    Returns (verts2d_px, scale, offset_px).
-    """
-    w, h = size
-    # Project to XY plane for fit
-    xy = verts[:, :2]
-    mins = xy.min(axis=0)
-    maxs = xy.max(axis=0)
-    span = (maxs - mins).max()
-    if span <= 0:
+def _fit_percentile(rot_verts: np.ndarray, size: Tuple[int,int],
+                    margin: int = 16, lo: float = 1.0, hi: float = 99.0):
+    """Fit to canvas using percentile bbox (robust to stray vertices)."""
+    W,H = size
+    xy = rot_verts[:, :2]
+    lo_xy = np.percentile(xy, lo, axis=0)
+    hi_xy = np.percentile(xy, hi, axis=0)
+    span = max(hi_xy - lo_xy).item()
+    if not np.isfinite(span) or span <= 0:
         span = 1.0
-
-    usable = np.array([w - 2 * margin_px, h - 2 * margin_px], dtype=np.float32)
-    scale = float(min(usable[0], usable[1]) / span)
-
-    # Scale + center
-    xy_scaled = (xy - mins[None, :]) * scale + margin_px
-    bbox = np.array([xy_scaled.min(axis=0), xy_scaled.max(axis=0)])
-    center_offset = (np.array([w, h], dtype=np.float32) - (bbox[0] + bbox[1])) * 0.5
+    usable = np.array([W - 2*margin, H - 2*margin], dtype=np.float32)
+    scale = float(min(usable) / span)
+    xy_scaled = (xy - lo_xy[None,:]) * scale + margin
+    bb0 = xy_scaled.min(axis=0); bb1 = xy_scaled.max(axis=0)
+    center_offset = (np.array([W,H], np.float32) - (bb0 + bb1))*0.5
     xy_final = xy_scaled + center_offset
     return xy_final, scale, center_offset
 
+# ------------- robust loading ------------
 
-# --------------------------- mesh prep ------------------------------------
-
-def _ensure_trimesh(mesh_or_scene) -> trimesh.Trimesh:
-    """
-    Guarantees a Trimesh. Scenes are concatenated; point clouds become convex hulls.
-    """
-    m = mesh_or_scene
+def _ensure_trimesh(m) -> trimesh.Trimesh:
     if isinstance(m, trimesh.Scene):
-        # dump returns (geometry, transforms); concatenate to a single mesh
         m = trimesh.util.concatenate(m.dump())
     if isinstance(m, trimesh.points.PointCloud):
-        # fall back to convex hull if only points provided
-        m = m.convex_hull
+        # point cloud → hull
+        try: m = m.convex_hull
+        except Exception: pass
     if not isinstance(m, trimesh.Trimesh):
-        # try to coerce
         try:
-            m = trimesh.Trimesh(vertices=np.array(m.vertices), faces=np.array(m.faces))
+            m = trimesh.Trimesh(vertices=np.asarray(m.vertices), faces=np.asarray(m.faces))
         except Exception:
-            # last resort: build convex hull from vertices if present
-            v = np.array(getattr(m, "vertices", []))
-            m = trimesh.Trimesh(vertices=v, faces=[]) if v.size else trimesh.creation.icosphere(subdivisions=1, radius=1.0)
+            v = np.asarray(getattr(m, "vertices", []))
+            if v.size:
+                try: m = trimesh.Trimesh(vertices=v)
+                except Exception: pass
+    if not isinstance(m, trimesh.Trimesh):
+        m = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
     return m
 
-
-def _load_mesh(path: Path) -> trimesh.Trimesh:
-    m = trimesh.load(str(path), force='mesh', process=True)
+def _load_large_tolerant(path: Path) -> trimesh.Trimesh:
+    # fast path: skip heavy 'process' work first
+    try:
+        m = trimesh.load(str(path), force='mesh', process=False, maintain_order=True)
+    except Exception:
+        m = trimesh.load(str(path), force='mesh', process=True)
     m = _ensure_trimesh(m)
 
-    # Cleanup to avoid degenerate/empty faces
-    with np.errstate(all='ignore'):
-        try: m.remove_duplicate_faces()
-        except Exception: pass
-        try: m.remove_degenerate_faces()
-        except Exception: pass
-        try: m.fill_holes()
-        except Exception: pass
+    # Quick clean; avoid expensive repairs on huge meshes
+    try: m.remove_degenerate_faces()
+    except Exception: pass
+    try: m.remove_duplicate_faces()
+    except Exception: pass
 
-    # If still no faces, try convex hull
-    if getattr(m, "faces", np.empty((0, 3))).shape[0] == 0:
-        try:
-            m = m.convex_hull
+    if getattr(m, "faces", np.empty((0,3))).shape[0] == 0:
+        try: m = m.convex_hull
         except Exception:
-            # fallback to tiny icosphere to avoid crashes
             m = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
 
-    # Ensure normals
+    # Normalize dtype/material
     try:
-        if not m.has_vertex_normals:
-            m.fix_normals()
-    except Exception:
-        pass
+        m.vertices = m.vertices.astype(np.float32, copy=False)
+    except Exception: pass
 
-    # Recenter to origin so iso fit looks good
-    try:
-        m.rezero()
-    except Exception:
-        pass
+    # Recenter
+    try: m.rezero()
+    except Exception: pass
 
     return m
 
+# ------------- shading/draw --------------
 
-# --------------------------- shading helpers ------------------------------
+def _per_face_colors(tri_normals: np.ndarray,
+                     base_rgb=(220,220,240),
+                     light_dir=(0.577,0.577,0.577),
+                     ambient=0.20) -> np.ndarray:
+    ld = np.asarray(light_dir, np.float32)
+    ld /= (np.linalg.norm(ld)+1e-9)
+    n = tri_normals.astype(np.float32)
+    dots = np.clip(n @ ld, 0.0, 1.0)
+    intens = np.clip(ambient + (1.0-ambient)*dots, ambient, 1.0)
+    base = np.asarray(base_rgb, np.float32)[None,:]
+    return (base * intens[:,None]).astype(np.uint8)
 
-def _lambert_face_colors(mesh: trimesh.Trimesh,
-                         base_rgb=(220, 220, 240),
-                         light_dir=(0.577, 0.577, 0.577),
-                         ambient=0.20) -> np.ndarray:
-    """
-    Simple Lambert shading per face normal.
-    Returns uint8 Nx3 color array.
-    """
-    if not hasattr(mesh, "face_normals") or mesh.face_normals is None or len(mesh.face_normals) == 0:
-        mesh.rezero()
-        mesh.fix_normals()
+def _triangle_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    tri = verts[faces]                      # (F,3,3)
+    n = np.cross(tri[:,1]-tri[:,0], tri[:,2]-tri[:,0])
+    norm = np.linalg.norm(n, axis=1) + 1e-9
+    n /= norm[:,None]
+    return n
 
-    n = mesh.face_normals.astype(np.float32)
-    ld = np.asarray(light_dir, dtype=np.float32)
-    ld /= (np.linalg.norm(ld) + 1e-9)
+def _depth_order(rot_verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    z = rot_verts[faces][:,:,2].mean(axis=1)
+    return np.argsort(z)[::-1]  # far→near
 
-    dots = np.clip((n @ ld), 0.0, 1.0)
-    intens = np.clip(ambient + (1.0 - ambient) * dots, ambient, 1.0)  # ambient floor
+def _to_int_pts(tri2d):  # tri2d: (3,2)
+    return [tuple(map(lambda x:int(round(x)), tri2d[i])) for i in range(3)]
 
-    base = np.asarray(base_rgb, dtype=np.float32)[None, :]
-    cols = (base * intens[:, None]).astype(np.uint8)
-    return cols
-
-
-# --------------------------- rasterization ---------------------------------
-
-def _project_isometric(vertices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Apply iso rotation to vertices.
-    Returns (rotated_vertices, rotation_matrix).
-    """
-    R = _iso_matrix().astype(np.float32)
-    v = vertices.astype(np.float32) @ R.T
-    return v, R
-
-
-def _depth_sort_indices(mesh: trimesh.Trimesh, rotated_vertices: np.ndarray) -> np.ndarray:
-    """
-    Sort faces back-to-front using mean Z in rotated space.
-    """
-    tris = rotated_vertices[mesh.faces]  # (F,3,3)
-    z_mean = tris[:, :, 2].mean(axis=1)
-    return np.argsort(z_mean)[::-1]  # far → near
-
-
-def _to_int_points(tri2d: np.ndarray) -> list[tuple[int, int]]:
-    return [(int(round(tri2d[0, 0])), int(round(tri2d[0, 1]))),
-            (int(round(tri2d[1, 0])), int(round(tri2d[1, 1]))),
-            (int(round(tri2d[2, 0])), int(round(tri2d[2, 1])))]
-
-
-# --------------------------- public API ------------------------------------
+# ------------- public API ----------------
 
 def render_mesh_to_image(
     file_path: str | Path,
-    size: Tuple[int, int] = (512, 512),
-    bg_rgba: Tuple[int, int, int, int] = (24, 24, 28, 0),
-    face_rgb: Tuple[int, int, int] = (220, 220, 240),
-    outline_rgb: Tuple[int, int, int] = (50, 50, 60),
-    outline_width: int = 1,
-    max_faces: int = 250_000,
-    draw_edges: bool = True
+    size: Tuple[int,int]=(512,512),
+    bg_rgba=(24,24,28,0),
+    face_rgb=(220,220,240),
+    outline_rgb=(60,60,70),
+    outline_width=1,
+    max_faces=250_000,
+    draw_edges=True,
+    debug_no_downsample=False,
+    debug_force_hull=False
 ) -> Image.Image:
-    """
-    Render a shaded isometric preview using PIL. No OpenGL required.
-
-    - Caps faces for performance (max_faces).
-    - Guarantees triangle fill; if mesh is faceless, uses convex hull.
-    - Depth-sorts faces; applies simple Lambert shading; optional edge outlines.
-
-    Returns a Pillow Image (RGBA).
-    """
     path = Path(file_path)
-    mesh = _load_mesh(path)
+    mesh = _load_large_tolerant(path)
 
-    # Cap huge meshes for speed (uniform face subsample)
-    F = mesh.faces.shape[0]
-    if F > max_faces:
-        idx = np.linspace(0, F - 1, num=max_faces, dtype=np.int64)
-        mesh = trimesh.Trimesh(vertices=mesh.vertices.copy(), faces=mesh.faces[idx].copy(), process=False)
+    # Debug option: Force convex hull to rule out degenerate geometry
+    if debug_force_hull:
+        print(f"DEBUG: Forcing convex hull for {path.name}")
+        mesh = mesh.convex_hull
 
-    # Rotate to iso & fit
-    verts_rot, _ = _project_isometric(mesh.vertices)
-    verts2d_px, _, _ = _fit_to_canvas(verts_rot, size=size, margin_px=16)
+    F = int(mesh.faces.shape[0])
+    if F == 0:
+        # silhouette fallback from hull
+        mesh = mesh.convex_hull
+        F = int(mesh.faces.shape[0])
 
-    # Shading colors per-face
-    face_cols = _lambert_face_colors(mesh, base_rgb=face_rgb)
+    # Debug option: Disable downsampling to confirm correctness (may be slow on huge files)
+    if debug_no_downsample:
+        print(f"DEBUG: No downsampling enabled for {path.name} (F={F})")
+    elif F > max_faces:
+        print(f"DEBUG: Downsampling {F} faces to {max_faces} for {path.name}")
+        sel = np.random.default_rng(42).choice(F, size=max_faces, replace=False)
+        mesh = trimesh.Trimesh(vertices=mesh.vertices.copy(), faces=mesh.faces[sel].copy(), process=False)
 
-    # Prepare canvas
-    W, H = size
-    img = Image.new("RGBA", (W, H), bg_rgba)
+    # rotate & fit
+    v_rot = _project_iso(mesh.vertices)
+    v2d, _, _ = _fit_percentile(v_rot, size=size, margin=16, lo=1.0, hi=99.0)
+
+    # per-face normals (no dependency on precomputed vertex normals)
+    triN = _triangle_normals(v_rot, mesh.faces)
+    cols = _per_face_colors(triN, base_rgb=face_rgb)
+
+    # canvas
+    W,H = size
+    img = Image.new("RGBA", (W,H), bg_rgba)
     draw = ImageDraw.Draw(img, "RGBA")
 
-    # Depth sort faces
-    order = _depth_sort_indices(mesh, verts_rot)
+    order = _depth_order(v_rot, mesh.faces)
+    tris2d = v2d[mesh.faces]  # (F,3,2)
 
-    # Draw filled triangles back-to-front
-    tris2d = verts2d_px[mesh.faces]  # (F,3,2)
+    # draw filled faces
     for i in order:
         tri = tris2d[i]
-        # Skip degenerate
-        if np.linalg.norm(np.cross(tri[1] - tri[0], tri[2] - tri[0])) < 1e-3:
+        # skip degenerate
+        area2 = np.cross(tri[1]-tri[0], tri[2]-tri[0])
+        if abs(area2) < 0.5:  # tiny
             continue
-        color = tuple(int(c) for c in face_cols[i])
-        draw.polygon(_to_int_points(tri), fill=color)
+        draw.polygon(_to_int_pts(tri), fill=tuple(int(c) for c in cols[i]))
 
-    # Optional subtle edge outlines for definition
+    # optional outline
     if draw_edges:
-        edge_color = outline_rgb + (220,)  # slightly translucent
         # unique edges
-        f = mesh.faces[np.newaxis, :, :]
-        e01 = mesh.faces[:, [0, 1]]
-        e12 = mesh.faces[:, [1, 2]]
-        e20 = mesh.faces[:, [2, 0]]
-        edges = np.vstack((e01, e12, e20))
-        # sort rows so undirected edges collapse on unique
-        edges = np.sort(edges, axis=1)
-        edges = np.unique(edges, axis=0)
-        v2 = verts2d_px
-        for a, b in edges:
-            p0 = (int(round(v2[a, 0])), int(round(v2[a, 1])))
-            p1 = (int(round(v2[b, 0])), int(round(v2[b, 1])))
-            draw.line([p0, p1], fill=edge_color, width=outline_width)
+        e = np.vstack((mesh.faces[:,[0,1]], mesh.faces[:,[1,2]], mesh.faces[:,[2,0]]))
+        e.sort(axis=1)
+        e = np.unique(e, axis=0)
+        c = outline_rgb + (220,)
+        for a,b in e:
+            p0 = (int(round(v2d[a,0])), int(round(v2d[a,1])))
+            p1 = (int(round(v2d[b,0])), int(round(v2d[b,1])))
+            draw.line([p0,p1], fill=c, width=outline_width)
 
     return img
-
 
 # --------------------------- CLI (optional) --------------------------------
 
