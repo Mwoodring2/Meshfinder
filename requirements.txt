@@ -1,11 +1,21 @@
-﻿PySide6>=6.6
-numpy
-scipy
-trimesh
-pyglet
-PyOpenGL
-PyOpenGL-accelerate
-pandas
-openpyxl
-scikit-learn>=1.0
-joblib
+﻿# ModelFinder - 3D Mesh Processing Dependencies
+# Core 3D processing
+trimesh>=4.0.0
+numpy>=1.21.0
+pillow>=8.0.0
+
+# Machine Learning for Similarity Search
+faiss-cpu>=1.7.0
+scikit-learn>=1.0.0
+joblib>=1.1.0
+
+# Excel import functionality
+pandas>=1.3.0
+openpyxl>=3.0.0
+
+# GUI framework
+PySide6>=6.0.0
+
+# Optional: Enhanced 3D processing
+# pyrender>=0.1.0  # For advanced rendering (requires OpenGL)
+# scipy>=1.7.0    # For advanced geometry processing
