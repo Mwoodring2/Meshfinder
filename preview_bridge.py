@@ -3,6 +3,16 @@
 from pathlib import Path
 from typing import Tuple
 
+def pick_max_faces(file_size_mb: float) -> int:
+    """Global face limit based on file size to prevent memory/CPU thrash"""
+    if file_size_mb > 300:  # ~6M tris
+        return 40_000
+    if file_size_mb > 200:  # ~4M tris
+        return 60_000
+    if file_size_mb > 120:  # ~2.4M tris
+        return 90_000
+    return 120_000
+
 def render_preview_qpixmap(file_path: str, size: Tuple[int, int] = (384, 384), debug_force_hull: bool = False):
     """
     Efficient preview generation for large STL/OBJ files.
@@ -43,14 +53,14 @@ def render_preview_qpixmap(file_path: str, size: Tuple[int, int] = (384, 384), d
     except Exception:
         pass
 
-    # Adaptive face limits based on file size
+    # Use global face limit system
     file_size_mb = path.stat().st_size / (1024 * 1024)
-    if file_size_mb > 200:
-        max_faces = 90_000
-    elif file_size_mb > 100:
-        max_faces = 120_000
-    else:
-        max_faces = 150_000
+    max_faces = pick_max_faces(file_size_mb)
+    
+    # Hard kill-switch before rendering for extremely large meshes
+    if hasattr(mesh, 'faces') and mesh.faces.shape[0] > 3_000_000:
+        mesh = mesh.convex_hull
+        stats["notes"].append(f"Mesh too large ({mesh.faces.shape[0]:,} faces): using convex hull")
 
     # Render with optional debug mode
     try:

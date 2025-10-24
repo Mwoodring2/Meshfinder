@@ -3559,15 +3559,12 @@ class MainWindow(QtWidgets.QMainWindow):
             
             self.status.showMessage("Generating large preview...", 3000)
             
-            # Create a larger preview (512x512) with optimized settings for large files
-            # Check file size to determine appropriate face limit for large preview
+            # Use global face limit system for consistent performance
+            from solid_renderer import pick_max_faces
             file_size_mb = Path(self.current_preview_file).stat().st_size / (1024 * 1024)
-            if file_size_mb > 200:  # Very large files (200MB+) - very conservative
-                max_faces = 75000
-            elif file_size_mb > 100:  # Large files (100-200MB)
-                max_faces = 100000
-            else:  # Normal files
-                max_faces = 150000
+            max_faces = pick_max_faces(file_size_mb)
+            
+            self.status.showMessage(f"Large preview generated ({file_size_mb:.1f}MB, {max_faces:,} faces)", 3000)
             
             img = render_mesh_to_image(
                 file_path=self.current_preview_file,
@@ -3575,9 +3572,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 bg_rgba=(245, 245, 245, 255),  # Clean white background
                 face_rgb=(220, 220, 240),      # Light blue-gray for mesh
                 outline_rgb=(160, 160, 180),   # Subtle edge outlines
-                outline_width=1,
-                max_faces=max_faces,           # Optimized for large files
-                draw_edges=True
+                outline_width=1
+                # max_faces and draw_edges will be auto-determined by the renderer
             )
             
             # Convert to QPixmap and display in a new window

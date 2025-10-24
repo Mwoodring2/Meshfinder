@@ -6,6 +6,16 @@ import math, numpy as np
 from PIL import Image, ImageDraw
 import trimesh
 
+def pick_max_faces(file_size_mb: float) -> int:
+    """Global face limit based on file size to prevent memory/CPU thrash"""
+    if file_size_mb > 300:  # ~6M tris
+        return 40_000
+    if file_size_mb > 200:  # ~4M tris
+        return 60_000
+    if file_size_mb > 120:  # ~2.4M tris
+        return 90_000
+    return 120_000
+
 # ---------------- basics ----------------
 
 def _iso_matrix() -> np.ndarray:
@@ -129,20 +139,34 @@ def render_mesh_to_image(
     face_rgb=(220,220,240),
     outline_rgb=(60,60,70),
     outline_width=1,
-    max_faces=250_000,
-    draw_edges=True,
+    max_faces=None,  # Will be auto-determined if None
+    draw_edges=None,  # Will be auto-determined if None
     debug_no_downsample=False,
     debug_force_hull=False
 ) -> Image.Image:
     path = Path(file_path)
     mesh = _load_large_tolerant(path)
 
+    # Auto-determine face limits and edge drawing based on file size
+    file_size_mb = path.stat().st_size / (1024 * 1024)
+    if max_faces is None:
+        max_faces = pick_max_faces(file_size_mb)
+    if draw_edges is None:
+        draw_edges = (max_faces >= 100_000) and (file_size_mb <= 150)
+
+    # Hard kill-switch before rendering for extremely large meshes
+    F = int(mesh.faces.shape[0])
+    if F > 3_000_000:
+        print(f"DEBUG: Mesh too large ({F:,} faces): using convex hull for {path.name}")
+        mesh = mesh.convex_hull
+        F = int(mesh.faces.shape[0])
+
     # Debug option: Force convex hull to rule out degenerate geometry
     if debug_force_hull:
         print(f"DEBUG: Forcing convex hull for {path.name}")
         mesh = mesh.convex_hull
+        F = int(mesh.faces.shape[0])
 
-    F = int(mesh.faces.shape[0])
     if F == 0:
         # silhouette fallback from hull
         mesh = mesh.convex_hull
