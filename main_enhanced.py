@@ -656,44 +656,23 @@ class ThumbnailGenWorker(QtCore.QRunnable):
             return
         
         try:
-            # Use the new solid_renderer for clean, professional 3D previews
-            from solid_renderer import render_mesh_to_image
-            from PIL.ImageQt import ImageQt
+            # Use the new preview_bridge for safe, robust 3D previews
+            from preview_bridge import render_preview_qpixmap
             
-            # Generate high-quality isometric preview using solid_renderer
-            # Use conservative face limits for very large files (200-300MB+)
-            # Check file size to determine appropriate face limit
-            file_size_mb = Path(self.file_path).stat().st_size / (1024 * 1024)
-            if file_size_mb > 200:  # Very large files (200MB+)
-                max_faces = 30000 if self.size <= 256 else 50000
-            elif file_size_mb > 100:  # Large files (100-200MB)
-                max_faces = 50000 if self.size <= 256 else 100000
-            else:  # Normal files
-                max_faces = 100000 if self.size <= 256 else 150000
+            # Generate high-quality isometric preview using preview_bridge
+            # This handles large files safely with built-in stats collection
+            pm, stats = render_preview_qpixmap(self.file_path, size=(self.size, self.size))
             
-            img = render_mesh_to_image(
-                file_path=self.file_path, 
-                size=(self.size, self.size),
-                bg_rgba=(245, 245, 245, 255),  # Clean white background
-                face_rgb=(220, 220, 240),      # Light blue-gray for mesh
-                outline_rgb=(160, 160, 180),   # Subtle edge outlines
-                outline_width=1,
-                max_faces=max_faces,           # Adaptive limit based on size
-                draw_edges=True
-            )
-            
-            # Convert PIL Image to QPixmap using ImageQt
-            qimage = ImageQt(img)
-            pm = QtGui.QPixmap.fromImage(qimage)
-            
-            if not pm.isNull():
+            if pm and not pm.isNull():
                 self.cache.save_thumbnail(self.file_path, pm)
-                # Show file size and face limit in status for large files
-                if file_size_mb > 100:
-                    print(f"Generated thumbnail for {Path(self.file_path).name}: {file_size_mb:.1f}MB, max_faces={max_faces}")
+                # Show stats for large files
+                if stats.get("faces", 0) > 100000:
+                    print(f"Generated thumbnail for {Path(self.file_path).name}: {stats.get('faces', 0):,} faces, {stats.get('vertices', 0):,} vertices")
+                    if stats.get("notes"):
+                        print(f"  Notes: {'; '.join(stats['notes'])}")
                 
         except ImportError:
-            # Fallback to original method if solid_renderer not available
+            # Fallback to original method if preview_bridge not available
             self._fallback_render()
         except Exception as e:
             # Silently fail - thumbnail generation is optional
@@ -887,17 +866,12 @@ class GeometryWorker(QtCore.QRunnable):
             
             for p in self.paths:
                 try:
-                    m = trimesh.load(p, force='mesh', skip_materials=True)
-                    if m is None or (hasattr(m, 'is_empty') and m.is_empty):
-                        continue
+                    # Use robust mesh stats to avoid Scene/PointCloud issues
+                    stats = self._safe_mesh_stats(p)
                     
-                    tris = int(m.faces.shape[0]) if hasattr(m, 'faces') else None
-                    bounds = m.bounds if hasattr(m, 'bounds') else None
-                    dx = dy = dz = None
-                    
-                    if bounds is not None:
-                        (minx, miny, minz), (maxx, maxy, maxz) = bounds
-                        dx, dy, dz = float(maxx - minx), float(maxy - miny), float(maxz - minz)
+                    tris = stats.get('faces', 0) or 0
+                    extents = stats.get('extents', [0, 0, 0])
+                    dx, dy, dz = extents[0], extents[1], extents[2] if extents else (None, None, None)
                     
                     cur.execute(
                         """UPDATE files SET tris=?, dim_x=?, dim_y=?, dim_z=? WHERE path=?""",
@@ -911,6 +885,41 @@ class GeometryWorker(QtCore.QRunnable):
             con.close()
         except Exception as e:
             print(f"GeometryWorker error: {e}")
+
+    def _safe_mesh_stats(self, file_path: str):
+        """Robust mesh statistics that handles Scene/PointCloud coercion"""
+        import numpy as np
+        import trimesh
+        
+        try:
+            m = trimesh.load(file_path, force='mesh', process=False, maintain_order=True)
+            if isinstance(m, trimesh.Scene): 
+                m = trimesh.util.concatenate(m.dump())
+            if isinstance(m, trimesh.points.PointCloud): 
+                m = m.convex_hull
+            
+            try: 
+                V = int(getattr(m, "vertices", np.empty((0,3))).shape[0])
+            except Exception: 
+                V = None
+            try: 
+                F = int(getattr(m, "faces", np.empty((0,3))).shape[0])
+            except Exception: 
+                F = None
+            try: 
+                ext = tuple(map(float, getattr(m, "extents", [0,0,0])))
+            except Exception: 
+                ext = None
+            
+            return {
+                "vertices": V, 
+                "faces": F, 
+                "extents": ext, 
+                "watertight": bool(getattr(m, "is_watertight", False))
+            }
+        except Exception as e:
+            print(f"Safe mesh stats failed for {file_path}: {e}")
+            return {"vertices": None, "faces": None, "extents": None, "watertight": False}
 
 # -----------------------------
 # Dialog Classes
@@ -3471,10 +3480,59 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     self.meta_dimensions.setText("N/A")
             else:
-                self.info_tris.setText("Tris: Failed")
-                self.meta_dimensions.setText("Failed")
+                # Try robust mesh stats as fallback
+                try:
+                    stats = self._safe_mesh_stats(file_path)
+                    if stats.get('faces'):
+                        self.info_tris.setText(f"Tris: {stats['faces']:,}")
+                    else:
+                        self.info_tris.setText("Tris: Failed")
+                    
+                    if stats.get('extents'):
+                        dx, dy, dz = stats['extents']
+                        self.meta_dimensions.setText(f"{dx:.1f} × {dy:.1f} × {dz:.1f}")
+                    else:
+                        self.meta_dimensions.setText("Failed")
+                except Exception:
+                    self.info_tris.setText("Tris: Failed")
+                    self.meta_dimensions.setText("Failed")
         except Exception as e:
             print(f"Error refreshing geometry info: {e}")
+
+    def _safe_mesh_stats(self, file_path: str):
+        """Robust mesh statistics that handles Scene/PointCloud coercion"""
+        import numpy as np
+        import trimesh
+        
+        try:
+            m = trimesh.load(file_path, force='mesh', process=False, maintain_order=True)
+            if isinstance(m, trimesh.Scene): 
+                m = trimesh.util.concatenate(m.dump())
+            if isinstance(m, trimesh.points.PointCloud): 
+                m = m.convex_hull
+            
+            try: 
+                V = int(getattr(m, "vertices", np.empty((0,3))).shape[0])
+            except Exception: 
+                V = None
+            try: 
+                F = int(getattr(m, "faces", np.empty((0,3))).shape[0])
+            except Exception: 
+                F = None
+            try: 
+                ext = tuple(map(float, getattr(m, "extents", [0,0,0])))
+            except Exception: 
+                ext = None
+            
+            return {
+                "vertices": V, 
+                "faces": F, 
+                "extents": ext, 
+                "watertight": bool(getattr(m, "is_watertight", False))
+            }
+        except Exception as e:
+            print(f"Safe mesh stats failed for {file_path}: {e}")
+            return {"vertices": None, "faces": None, "extents": None, "watertight": False}
     
     def _load_thumbnail(self, file_path: str, name: str, ext: str):
         """Load thumbnail for the given file"""
@@ -3489,15 +3547,47 @@ class MainWindow(QtWidgets.QMainWindow):
             self._display_thumbnail(cached)
             return
 
-        # 2) For 3D files, generate thumbnail immediately
+        # 2) For 3D files, use preview_bridge for immediate generation with stats
         if ext.lower() in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
             self.preview_thumbnail.setText("Generating 3D preview...")
-            # Generate thumbnail immediately in background
-            worker = ThumbnailGenWorker(file_path, self.thumbnail_cache, 256)
-            QtCore.QThreadPool.globalInstance().start(worker)
-            # Refresh after generation
-            QtCore.QTimer.singleShot(2000, lambda: self._refresh_if_cache_ready(file_path))
-            return
+            
+            try:
+                # Use preview_bridge for immediate, reliable preview generation
+                from preview_bridge import render_preview_qpixmap
+                
+                pix, stats = render_preview_qpixmap(file_path, size=(384, 384))
+                if pix:
+                    self.preview_thumbnail.setPixmap(pix.scaled(
+                        self.preview_thumbnail.size() - QtCore.QSize(10, 10),
+                        QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
+                        QtCore.Qt.TransformationMode.SmoothTransformation
+                    ))
+                    
+                    # Update geometry info with reliable stats
+                    if stats.get('faces'):
+                        self.info_tris.setText(f"Tris: {stats['faces']:,}")
+                    if stats.get('extents'):
+                        dx, dy, dz = stats['extents']
+                        self.meta_dimensions.setText(f"{dx:.1f} × {dy:.1f} × {dz:.1f}")
+                    
+                    # Cache the generated thumbnail
+                    self.thumbnail_cache.save_thumbnail(file_path, pix)
+                    return
+                else:
+                    # Show error message with notes
+                    notes = stats.get('notes', ['Unknown error'])
+                    self.preview_thumbnail.setText(f"Preview failed\n{'; '.join(notes[:2])}")
+                    return
+                    
+            except ImportError:
+                # Fallback to background generation if preview_bridge not available
+                worker = ThumbnailGenWorker(file_path, self.thumbnail_cache, 256)
+                QtCore.QThreadPool.globalInstance().start(worker)
+                QtCore.QTimer.singleShot(2000, lambda: self._refresh_if_cache_ready(file_path))
+                return
+            except Exception as e:
+                self.preview_thumbnail.setText(f"Preview error\n{str(e)[:50]}")
+                return
 
         # 3) For other files, show neutral placeholder
         ph = QtGui.QPixmap(160, 160)
@@ -3536,6 +3626,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if ext in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
             m.addAction("🔍 Large Preview", self._generate_large_preview)
             m.addAction("🐛 Debug Preview", self._debug_preview)
+            m.addAction("📊 Mesh Analysis", self._analyze_mesh)
         
         m.addAction("🗑️ Clear Thumbnail Cache", self._clear_thumbnail_cache)
         m.addSeparator()
@@ -3849,6 +3940,229 @@ class MainWindow(QtWidgets.QMainWindow):
                     
         except Exception as e:
             QtWidgets.QMessageBox.critical(parent_window, "Debug Hull Error", f"Failed to generate hull preview: {e}")
+
+    def _analyze_mesh(self):
+        """Analyze mesh using mesh_probe.py and show detailed report"""
+        try:
+            if not self.current_preview_file:
+                QtWidgets.QMessageBox.warning(self, "No File Selected", 
+                    "No file is currently selected for analysis.")
+                return
+            
+            if not Path(self.current_preview_file).exists():
+                QtWidgets.QMessageBox.warning(self, "File Not Found", 
+                    "Selected file no longer exists.")
+                return
+            
+            # Check if it's a 3D file
+            ext = Path(self.current_preview_file).suffix.lower()
+            if ext not in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
+                QtWidgets.QMessageBox.information(self, "Not a 3D File", 
+                    "Mesh analysis is only available for 3D model files.")
+                return
+            
+            # Import mesh_probe functionality
+            import subprocess
+            import tempfile
+            import json
+            
+            self.status.showMessage("Analyzing mesh...", 3000)
+            
+            # Create temporary files for analysis
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as report_file:
+                report_path = report_file.name
+            
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as thumb_file:
+                thumb_path = thumb_file.name
+            
+            try:
+                # Run mesh_probe.py
+                cmd = [
+                    'python', 'mesh_probe.py',
+                    '--in', self.current_preview_file,
+                    '--out', report_path,
+                    '--thumb', thumb_path,
+                    '--max-faces', '150000'
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                
+                if result.returncode != 0:
+                    QtWidgets.QMessageBox.critical(self, "Analysis Failed", 
+                        f"Mesh analysis failed:\n{result.stderr}")
+                    return
+                
+                # Load and display the report
+                with open(report_path, 'r') as f:
+                    report = json.load(f)
+                
+                # Create analysis window
+                analysis_window = QtWidgets.QDialog(self)
+                analysis_window.setWindowTitle(f"Mesh Analysis - {Path(self.current_preview_file).name}")
+                analysis_window.setModal(False)
+                analysis_window.resize(800, 600)
+                
+                layout = QtWidgets.QVBoxLayout(analysis_window)
+                
+                # Add report text
+                report_text = QtWidgets.QTextEdit()
+                report_text.setReadOnly(True)
+                report_text.setFont(QtGui.QFont("Consolas", 9))
+                
+                # Format the report nicely
+                report_display = self._format_mesh_report(report)
+                report_text.setPlainText(report_display)
+                layout.addWidget(report_text)
+                
+                # Add buttons
+                button_layout = QtWidgets.QHBoxLayout()
+                
+                if Path(thumb_path).exists():
+                    thumb_btn = QtWidgets.QPushButton("Show Thumbnail")
+                    thumb_btn.clicked.connect(lambda: self._show_analysis_thumbnail(thumb_path, analysis_window))
+                    button_layout.addWidget(thumb_btn)
+                
+                save_btn = QtWidgets.QPushButton("Save Report...")
+                save_btn.clicked.connect(lambda: self._save_analysis_report(report_path, analysis_window))
+                button_layout.addWidget(save_btn)
+                
+                close_btn = QtWidgets.QPushButton("Close")
+                close_btn.clicked.connect(analysis_window.close)
+                button_layout.addWidget(close_btn)
+                
+                layout.addLayout(button_layout)
+                
+                analysis_window.show()
+                self.status.showMessage("Mesh analysis completed", 2000)
+                
+            except subprocess.TimeoutExpired:
+                QtWidgets.QMessageBox.warning(self, "Analysis Timeout", 
+                    "Mesh analysis timed out. The file may be too large or complex.")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Analysis Error", f"Failed to analyze mesh: {e}")
+            finally:
+                # Clean up temporary files
+                try:
+                    Path(report_path).unlink(missing_ok=True)
+                    Path(thumb_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                    
+        except ImportError:
+            QtWidgets.QMessageBox.warning(self, "Mesh Probe Not Available", 
+                "The mesh_probe.py tool is not available. Please ensure it's in the project directory.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Analysis Error", f"Failed to analyze mesh: {e}")
+
+    def _format_mesh_report(self, report):
+        """Format the mesh analysis report for display"""
+        lines = []
+        lines.append("=== MESH ANALYSIS REPORT ===")
+        lines.append(f"File: {report.get('file', 'Unknown')}")
+        lines.append(f"Size: {report.get('size_bytes', 0) / (1024*1024):.1f} MB")
+        lines.append(f"Exists: {report.get('exists', False)}")
+        lines.append("")
+        
+        # Loader info
+        loader = report.get('loader', {})
+        lines.append("=== LOADER INFO ===")
+        lines.append(f"Mode: {loader.get('mode', 'Unknown')}")
+        lines.append(f"Attempted: {', '.join(loader.get('tried', []))}")
+        if loader.get('warnings'):
+            lines.append("Warnings:")
+            for warning in loader['warnings']:
+                lines.append(f"  - {warning}")
+        lines.append("")
+        
+        # Mesh info
+        mesh = report.get('mesh', {})
+        lines.append("=== MESH PROPERTIES ===")
+        lines.append(f"Vertices: {mesh.get('vertices', 0):,}")
+        lines.append(f"Faces: {mesh.get('faces', 0):,}")
+        if mesh.get('extents'):
+            ext = mesh['extents']
+            lines.append(f"Dimensions: {ext[0]:.2f} × {ext[1]:.2f} × {ext[2]:.2f}")
+        lines.append(f"Watertight: {mesh.get('watertight', False)}")
+        if 'degenerate_faces_percent' in mesh:
+            lines.append(f"Degenerate faces: {mesh['degenerate_faces_percent']:.2f}%")
+        lines.append("")
+        
+        # Components
+        components = report.get('components', [])
+        if components:
+            lines.append("=== MESH COMPONENTS ===")
+            for i, comp in enumerate(components[:5]):
+                lines.append(f"Component {i+1}:")
+                lines.append(f"  Faces: {comp.get('faces', 0):,}")
+                lines.append(f"  Vertices: {comp.get('vertices', 0):,}")
+                if comp.get('extents'):
+                    ext = comp['extents']
+                    lines.append(f"  Size: {ext[0]:.2f} × {ext[1]:.2f} × {ext[2]:.2f}")
+        lines.append("")
+        
+        # Warnings and errors
+        if report.get('warnings'):
+            lines.append("=== WARNINGS ===")
+            for warning in report['warnings']:
+                lines.append(f"- {warning}")
+            lines.append("")
+        
+        if report.get('errors'):
+            lines.append("=== ERRORS ===")
+            for error in report['errors']:
+                lines.append(f"- {error}")
+        
+        return "\n".join(lines)
+
+    def _show_analysis_thumbnail(self, thumb_path, parent_window):
+        """Show the analysis thumbnail in a new window"""
+        try:
+            if not Path(thumb_path).exists():
+                QtWidgets.QMessageBox.information(parent_window, "No Thumbnail", 
+                    "Thumbnail was not generated.")
+                return
+            
+            thumb_window = QtWidgets.QDialog(parent_window)
+            thumb_window.setWindowTitle("Analysis Thumbnail")
+            thumb_window.setModal(False)
+            thumb_window.resize(600, 600)
+            
+            layout = QtWidgets.QVBoxLayout(thumb_window)
+            
+            # Load and display thumbnail
+            pixmap = QtGui.QPixmap(thumb_path)
+            if not pixmap.isNull():
+                label = QtWidgets.QLabel()
+                label.setPixmap(pixmap.scaled(512, 512, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+                label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(label)
+            
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.clicked.connect(thumb_window.close)
+            layout.addWidget(close_btn)
+            
+            thumb_window.show()
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(parent_window, "Thumbnail Error", f"Failed to show thumbnail: {e}")
+
+    def _save_analysis_report(self, report_path, parent_window):
+        """Save the analysis report to a file"""
+        try:
+            filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+                parent_window,
+                "Save Analysis Report",
+                f"{Path(self.current_preview_file).stem}_analysis.json",
+                "JSON Files (*.json);;All Files (*)"
+            )
+            
+            if filename:
+                import shutil
+                shutil.copy2(report_path, filename)
+                self.status.showMessage(f"Report saved to {filename}", 3000)
+                
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(parent_window, "Save Error", f"Failed to save report: {e}")
 
     def _open_in_explorer(self):
         """Open selected file in Windows Explorer"""
