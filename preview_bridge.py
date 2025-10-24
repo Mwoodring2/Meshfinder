@@ -1,31 +1,23 @@
-# preview_bridge.py — tiny bridge from file path → QPixmap (Qt) or PNG (headless)
+# preview_bridge.py — streamlined bridge for efficient 3D previews
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 def render_preview_qpixmap(file_path: str, size: Tuple[int, int] = (384, 384), debug_force_hull: bool = False):
     """
-    Safe preview entrypoint for huge STL/OBJ.
+    Efficient preview generation for large STL/OBJ files.
     Returns (QPixmap | None, stats: dict).
-    
-    Args:
-        file_path: Path to 3D file
-        size: Preview dimensions
-        debug_force_hull: If True, force convex hull to detect degenerate/self-intersecting source
     """
-    import json
     import numpy as np
     from PySide6 import QtGui
     from PIL.ImageQt import ImageQt
-
-    # Lazy import to avoid heavy deps at module import
     from solid_renderer import render_mesh_to_image
     import trimesh
 
     stats = {"faces": None, "vertices": None, "extents": None, "watertight": None, "notes": []}
     path = Path(file_path)
 
-    # ---- 1) Inspect quickly and defensively
+    # Fast mesh loading with fallback
     mesh = None
     for process in (False, True):
         try:
@@ -35,47 +27,40 @@ def render_preview_qpixmap(file_path: str, size: Tuple[int, int] = (384, 384), d
             if isinstance(m, trimesh.points.PointCloud):
                 m = m.convex_hull
             mesh = m
-            stats["notes"].append(f"loaded process={process}")
             break
-        except Exception as e:
-            stats["notes"].append(f"load failed process={process}: {e}")
+        except Exception:
+            continue
 
     if mesh is None:
-        stats["notes"].append("fallback: unable to load mesh")
         return None, stats
 
+    # Extract stats efficiently
     try:
-        V = int(getattr(mesh, "vertices", np.empty((0, 3))).shape[0])
-        F = int(getattr(mesh, "faces", np.empty((0, 3))).shape[0])
-        stats["vertices"] = V
-        stats["faces"] = F
-        stats["extents"] = tuple(map(float, getattr(mesh, "extents", [0, 0, 0])))
-        stats["watertight"] = bool(getattr(mesh, "is_watertight", False))
-    except Exception as e:
-        stats["notes"].append(f"stat failure: {e}")
+        stats["vertices"] = int(mesh.vertices.shape[0])
+        stats["faces"] = int(mesh.faces.shape[0])
+        stats["extents"] = tuple(map(float, mesh.extents))
+        stats["watertight"] = bool(mesh.is_watertight)
+    except Exception:
+        pass
 
-    # ---- 2) Render shaded isometric via PIL (robust to big/dirty meshes)
+    # Adaptive face limits based on file size
+    file_size_mb = path.stat().st_size / (1024 * 1024)
+    if file_size_mb > 200:
+        max_faces = 90_000
+    elif file_size_mb > 100:
+        max_faces = 120_000
+    else:
+        max_faces = 150_000
+
+    # Render with optional debug mode
     try:
-        # Determine face cap based on file size to prevent memory/CPU thrash
-        file_size_mb = Path(file_path).stat().st_size / (1024 * 1024)
-        if file_size_mb > 200:  # Very large files (200MB+) - very conservative
-            max_faces = 90_000
-            stats["notes"].append(f"Large file ({file_size_mb:.1f}MB): using conservative {max_faces:,} face limit")
-        elif file_size_mb > 100:  # Large files (100-200MB)
-            max_faces = 120_000
-        else:  # Normal files
-            max_faces = 150_000
-        
         if debug_force_hull:
-            # Debug mode: Force convex hull to detect degenerate/self-intersecting source
-            stats["notes"].append("DEBUG: Forcing convex hull")
             mesh = mesh.convex_hull
             img = render_mesh_to_image(mesh, size=size, max_faces=max_faces)
         else:
-            # Normal mode: Use file path directly
             img = render_mesh_to_image(file_path, size=size, max_faces=max_faces)
         
-        qimage = ImageQt(img)   # PIL → QImage
+        qimage = ImageQt(img)
         pixmap = QtGui.QPixmap.fromImage(qimage)
         return pixmap, stats
     except Exception as e:
