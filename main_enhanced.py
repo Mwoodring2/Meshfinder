@@ -660,173 +660,149 @@ class ThumbnailGenWorker(QtCore.QRunnable):
             import numpy as np
             from PIL import Image, ImageDraw, ImageFont
             
-            # Load mesh
-            m = trimesh.load(self.file_path, force='mesh', skip_materials=True)
+            # Load mesh - Force Trimesh to return a triangular mesh
+            m = trimesh.load(self.file_path, force='mesh', process=True)
             if m is None:
                 return
             
-            # Try to use trimesh's built-in rendering (requires pyglet<2)
-            try:
-                png = m.scene().save_image(
-                    resolution=(self.size, self.size), 
-                    visible=True, 
-                    background=[43, 43, 43, 255]
-                )
-                
-                if png:
-                    pm = QtGui.QPixmap()
-                    pm.loadFromData(png, "PNG")
-                    
-                    if not pm.isNull():
-                        self.cache.save_thumbnail(self.file_path, pm)
-                        return
-            except Exception as render_error:
-                # Rendering failed - use fallback icon generation
-                pass
+            # Ensure we have a proper Trimesh object, not a scene or point cloud
+            if not isinstance(m, trimesh.Trimesh):
+                # Convert scenes into one Trimesh
+                m = m.dump(concatenate=True)
             
-            # Create a Windows File Explorer-style solid mesh preview
-            img = Image.new('RGB', (self.size, self.size), color=(240, 240, 240))  # Light background like Windows
+            # Validate we have a proper mesh
+            if not isinstance(m, trimesh.Trimesh):
+                print(f"Warning: {self.file_path} could not be loaded as a proper mesh")
+                return
+            
+            # Ensure faces exist - if no faces, try to reconstruct from convex hull
+            if m.faces.shape[0] == 0:
+                print(f"Warning: {self.file_path} has no faces, attempting to reconstruct from convex hull")
+                m = m.convex_hull
+                
+            # Final validation
+            if m.faces.shape[0] == 0:
+                print(f"Warning: {self.file_path} still has no faces after convex hull reconstruction")
+                return
+            
+            # Compute vertex normals if absent - Lambert shading depends on normals
+            if not hasattr(m, 'vertex_normals') or m.vertex_normals is None or len(m.vertex_normals) == 0:
+                print(f"Computing normals for {self.file_path}")
+                m.fix_normals()
+            
+            # Auto-correct bad meshes for better rendering (with error handling)
+            try:
+                print(f"Auto-correcting mesh for {self.file_path}")
+                m.remove_duplicate_faces()
+                m.remove_degenerate_faces()
+                m.fill_holes()
+            except Exception as e:
+                print(f"Warning: Mesh auto-correction failed for {self.file_path}: {e}")
+                # Continue with rendering even if auto-correction fails
+            
+            # Skip trimesh scene rendering - use our custom solid mesh renderer instead
+            # This ensures we get clean solid mesh previews instead of point clouds
+            
+            # Create a clean, solid mesh preview like Windows File Explorer
+            img = Image.new('RGB', (self.size, self.size), color=(245, 245, 245))  # Clean white background
             draw = ImageDraw.Draw(img)
             
             try:
-                vertices = m.vertices if hasattr(m, 'vertices') else []
-                faces = m.faces if hasattr(m, 'faces') else []
+                # Fix 1: Ensure we have proper mesh with vertices and faces
+                if hasattr(m, 'vertices') and hasattr(m, 'faces'):
+                    vertices = np.array(m.vertices)
+                    faces = np.array(m.faces)
+                else:
+                    # Fallback: check if it's a point cloud
+                    if hasattr(m, 'vertices') and not hasattr(m, 'faces'):
+                        print(f"Warning: {self.file_path} is a point cloud, not a mesh")
+                        return
+                    else:
+                        print(f"Warning: {self.file_path} has no vertices")
+                        return
                 
-                if vertices is not None and len(vertices) > 0 and faces is not None and len(faces) > 0:
-                    # Calculate mesh bounds and center
-                    min_coords = vertices.min(axis=0)
-                    max_coords = vertices.max(axis=0)
-                    center = (min_coords + max_coords) / 2
+                # Validate mesh data
+                if len(vertices) == 0 or len(faces) == 0:
+                    print(f"Warning: {self.file_path} has empty vertices or faces")
+                    return
+                
+                # Ensure faces are triangular
+                faces = faces[:, :3] if faces.shape[1] > 3 else faces
+                
+                # Calculate mesh bounds and center
+                min_coords = vertices.min(axis=0)
+                max_coords = vertices.max(axis=0)
+                center = (min_coords + max_coords) / 2
+                
+                # Normalize vertices to fit in preview
+                max_dim = np.max(max_coords - min_coords)
+                if max_dim > 0:
+                    vertices_normalized = (vertices - center) / max_dim * (self.size * 0.6)
                     
-                    # Normalize vertices to fit in preview with padding
-                    max_dim = np.max(max_coords - min_coords)
-                    if max_dim > 0:
-                        vertices_normalized = (vertices - center) / max_dim * (self.size * 0.7)
-                        
-                        # Better 3D to 2D projection (isometric with slight perspective)
-                        vertices_2d = np.zeros((len(vertices_normalized), 2))
-                        # Isometric projection with slight Z depth
-                        vertices_2d[:, 0] = (vertices_normalized[:, 0] * 0.866 - vertices_normalized[:, 2] * 0.5) + self.size/2
-                        vertices_2d[:, 1] = (vertices_normalized[:, 1] * 0.866 + vertices_normalized[:, 0] * 0.5 + vertices_normalized[:, 2] * 0.5) + self.size/2
-                        
-                        # Create a proper depth buffer for z-buffering
-                        depth_buffer = np.full((self.size, self.size), -np.inf)
-                        color_buffer = np.zeros((self.size, self.size, 3), dtype=np.uint8)
-                        color_buffer.fill(240)  # Background color
-                        
-                        # Sample faces for performance (max 2000 faces for preview)
-                        face_sample_rate = max(1, len(faces) // 2000)
-                        sampled_faces = faces[::face_sample_rate]
-                        
-                        # Calculate face normals for lighting
-                        face_normals = []
-                        face_centers = []
-                        face_depths = []
-                        
-                        for face in sampled_faces:
-                            if len(face) >= 3:
-                                # Get face vertices
-                                v1 = vertices_normalized[face[0]]
-                                v2 = vertices_normalized[face[1]]
-                                v3 = vertices_normalized[face[2]]
-                                
-                                # Calculate face normal
-                                edge1 = v2 - v1
-                                edge2 = v3 - v1
-                                normal = np.cross(edge1, edge2)
-                                normal_len = np.linalg.norm(normal)
-                                if normal_len > 0:
-                                    normal = normal / normal_len
-                                
-                                face_center = (v1 + v2 + v3) / 3
-                                face_depth = face_center[2]
-                                
-                                face_normals.append(normal)
-                                face_centers.append(face_center)
-                                face_depths.append((face_depth, face, normal, face_center))
-                        
-                        # Sort faces by depth (back to front)
-                        face_depths.sort(key=lambda x: x[0])
-                        
-                        # Light direction (from top-left)
-                        light_dir = np.array([-0.5, -0.5, 1.0])
-                        light_dir = light_dir / np.linalg.norm(light_dir)
-                        
-                        # Render faces with proper shading
-                        for face_depth, face, normal, face_center in face_depths:
-                            if len(face) >= 3:
-                                try:
-                                    # Get face vertices in 2D
-                                    face_2d = vertices_2d[face[:3]]
-                                    
-                                    # Calculate face bounds
-                                    min_x = int(np.min(face_2d[:, 0]))
-                                    max_x = int(np.max(face_2d[:, 0]))
-                                    min_y = int(np.min(face_2d[:, 1]))
-                                    max_y = int(np.max(face_2d[:, 1]))
-                                    
-                                    # Skip if face is completely outside bounds
-                                    if max_x < 0 or min_x >= self.size or max_y < 0 or min_y >= self.size:
-                                        continue
-                                    
-                                    # Clamp bounds
-                                    min_x = max(0, min_x)
-                                    max_x = min(self.size - 1, max_x)
-                                    min_y = max(0, min_y)
-                                    max_y = min(self.size - 1, max_y)
-                                    
-                                    # Calculate lighting (Lambert shading)
-                                    light_intensity = max(0.3, np.dot(normal, light_dir))
-                                    
-                                    # Base color (grey like Windows)
-                                    base_color = 180
-                                    shaded_color = int(base_color * light_intensity)
-                                    face_color = (shaded_color, shaded_color, shaded_color)
-                                    
-                                    # Create polygon points for rasterization
-                                    polygon_points = [(int(p[0]), int(p[1])) for p in face_2d]
-                                    
-                                    # Draw filled triangle with proper color
-                                    draw.polygon(polygon_points, fill=face_color)
-                                    
-                                except (IndexError, ValueError):
-                                    continue
-                        
-                        # Add subtle edge lines for definition
-                        edge_sample_rate = max(1, len(faces) // 500)  # Sample fewer edges
-                        for face in faces[::edge_sample_rate]:
-                            if len(face) >= 3:
-                                try:
-                                    face_2d = vertices_2d[face[:3]]
-                                    # Draw triangle edges
-                                    for i in range(3):
-                                        start = face_2d[i]
-                                        end = face_2d[(i + 1) % 3]
-                                        if (0 <= start[0] < self.size and 0 <= start[1] < self.size and
-                                            0 <= end[0] < self.size and 0 <= end[1] < self.size):
-                                            draw.line([(int(start[0]), int(start[1])), (int(end[0]), int(end[1]))], 
-                                                     fill=(120, 120, 120), width=1)
-                                except (IndexError, ValueError):
-                                    continue
+                    # Simple isometric projection for clean 3D look
+                    vertices_2d = np.zeros((len(vertices_normalized), 2))
+                    # Isometric projection: x' = x - z, y' = y + (x + z)/2
+                    vertices_2d[:, 0] = (vertices_normalized[:, 0] - vertices_normalized[:, 2]) * 0.866 + self.size/2
+                    vertices_2d[:, 1] = (vertices_normalized[:, 1] + (vertices_normalized[:, 0] + vertices_normalized[:, 2]) * 0.5) * 0.866 + self.size/2
                     
-                    # Add clean border like Windows
-                    padding = 2
+                    # Depth-sort faces correctly using face centers
+                    faces_z = vertices_normalized[faces].mean(axis=1)[:, 2]
+                    sorted_idx = np.argsort(faces_z)[::-1]  # far → near
+                    
+                    # Simple Lambert lighting setup
+                    light_dir = np.array([0.577, 0.577, 0.577])
+                    light_dir /= np.linalg.norm(light_dir)
+                    normals = m.face_normals
+                    intensity = np.clip(normals @ light_dir, 0.2, 1.0)
+                    colors = (intensity[:, None] * np.array([220, 220, 240])).astype(np.uint8)
+                    
+                    # Render faces with proper depth sorting and lighting
+                    for i in sorted_idx:
+                        face = faces[i]
+                        if len(face) >= 3:
+                            try:
+                                # Get face vertices in 2D
+                                face_2d = vertices_2d[face[:3]]
+                                
+                                # Get pre-calculated lighting color for this face
+                                face_color = tuple(colors[i])
+                                
+                                # Create polygon points
+                                polygon_points = [(int(p[0]), int(p[1])) for p in face_2d]
+                                
+                                # Draw filled triangle
+                                draw.polygon(polygon_points, fill=face_color)
+                                
+                                # Add subtle edge for definition
+                                for j in range(3):
+                                    start = face_2d[j]
+                                    end = face_2d[(j + 1) % 3]
+                                    if (0 <= start[0] < self.size and 0 <= start[1] < self.size and
+                                        0 <= end[0] < self.size and 0 <= end[1] < self.size):
+                                        draw.line([(int(start[0]), int(start[1])), (int(end[0]), int(end[1]))], 
+                                                 fill=(160, 160, 160), width=1)
+                                
+                            except (IndexError, ValueError):
+                                continue
+                    
+                    # Add clean border
+                    padding = 3
                     draw.rectangle([padding, padding, self.size - padding, self.size - padding],
-                                 outline=(200, 200, 200), width=1)
+                                 outline=(180, 180, 180), width=1)
                     
                 else:
                     # No valid geometry - show clean placeholder
                     center_x, center_y = self.size // 2, self.size // 2
-                    draw.ellipse([center_x - 15, center_y - 15, center_x + 15, center_y + 15],
-                               fill=(220, 220, 220), outline=(150, 150, 150), width=1)
-                    draw.text((center_x - 8, center_y - 5), "3D", fill=(100, 100, 100))
+                    draw.ellipse([center_x - 20, center_y - 20, center_x + 20, center_y + 20],
+                               fill=(230, 230, 230), outline=(180, 180, 180), width=2)
+                    draw.text((center_x - 15, center_y - 8), "3D", fill=(120, 120, 120))
                 
             except Exception as render_error:
                 # Clean fallback
                 center_x, center_y = self.size // 2, self.size // 2
-                draw.rectangle([center_x - 12, center_y - 12, center_x + 12, center_y + 12],
-                             fill=(220, 220, 220), outline=(150, 150, 150), width=1)
-                draw.text((center_x - 8, center_y - 5), "3D", fill=(100, 100, 100))
+                draw.rectangle([center_x - 15, center_y - 15, center_x + 15, center_y + 15],
+                             fill=(230, 230, 230), outline=(180, 180, 180), width=2)
+                draw.text((center_x - 10, center_y - 8), "3D", fill=(120, 120, 120))
             
             # Convert PIL image to QPixmap
             import io
