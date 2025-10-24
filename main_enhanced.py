@@ -4968,11 +4968,9 @@ Built with PySide6 and modern UI design principles.
             self.status.clearMessage()
     
     def import_excel_dialog(self): 
-        """Import Excel files with project part labels"""
+        """Import Excel files with robust header detection and auto-mapping"""
         try:
-            # Check if required libraries are available
-            import pandas as pd
-            import openpyxl
+            from app.dataio.import_excel import import_parts_from_excel
         except ImportError:
             QtWidgets.QMessageBox.warning(
                 self, APP_NAME,
@@ -4993,150 +4991,53 @@ Built with PySide6 and modern UI design principles.
         if not file_path:
             return
         
-        # Create import dialog with options
+        # Create import options dialog
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Import Excel - Configure Options")
-        dlg.resize(500, 400)
+        dlg.setWindowTitle("Import Excel - Options")
+        dlg.resize(500, 300)
         
         layout = QtWidgets.QVBoxLayout(dlg)
         
         # File info
-        file_group = QtWidgets.QGroupBox("File Information")
-        file_layout = QtWidgets.QFormLayout(file_group)
-        
-        file_name = Path(file_path).name
-        file_size = Path(file_path).stat().st_size / (1024 * 1024)
-        
-        file_layout.addRow("File:", QtWidgets.QLabel(file_name))
-        file_layout.addRow("Size:", QtWidgets.QLabel(f"{file_size:.2f} MB"))
-        
-        # Try to detect project info from filename
-        detected_project = ""
-        detected_name = ""
-        
-        # Common patterns: "300868_ProjectName.xlsx" or "300868-Project Name.xlsx"
-        import re
-        match = re.match(r"(\d+)[_\-\s]+(.+?)\.xls", file_name)
-        if match:
-            detected_project = match.group(1)
-            detected_name = match.group(2).replace("_", " ").replace("-", " ")
-        
-        layout.addWidget(file_group)
+        file_info = QtWidgets.QLabel(f"📁 {Path(file_path).name}")
+        file_info.setStyleSheet("font-weight: bold; color: #2c5aa0;")
+        layout.addWidget(file_info)
         
         # Import options
         options_group = QtWidgets.QGroupBox("Import Options")
         options_layout = QtWidgets.QFormLayout(options_group)
         
-        # Project number
-        project_num = QtWidgets.QLineEdit()
-        project_num.setText(detected_project)
-        project_num.setPlaceholderText("e.g., 300868")
-        options_layout.addRow("Project Number:", project_num)
+        # Allow missing files checkbox
+        allow_missing = QtWidgets.QCheckBox("Allow missing files (for planning only)")
+        allow_missing.setToolTip("Import parts even if file paths don't exist on disk")
+        allow_missing.setChecked(False)
+        options_layout.addRow(allow_missing)
         
-        # Project name
-        project_name = QtWidgets.QLineEdit()
-        project_name.setText(detected_name)
-        project_name.setPlaceholderText("e.g., Character Assets")
-        options_layout.addRow("Project Name:", project_name)
+        # Project inference
+        project_inference = QtWidgets.QCheckBox("Auto-detect project from current filter")
+        project_inference.setToolTip("Use the currently selected project filter as default project")
+        project_inference.setChecked(True)
+        options_layout.addRow(project_inference)
         
-        # Sheet selection (will be populated after reading file)
-        sheet_combo = QtWidgets.QComboBox()
-        sheet_combo.setToolTip("Select which Excel sheet to import")
+        # Base directory selection
+        base_dir_label = QtWidgets.QLabel("Base directory for relative paths:")
+        base_dir_edit = QtWidgets.QLineEdit()
+        base_dir_edit.setText(str(Path(file_path).parent))
+        base_dir_edit.setPlaceholderText("Leave empty to use Excel file's folder")
         
-        # Column mapping
-        col_group = QtWidgets.QGroupBox("Column Mapping")
-        col_layout = QtWidgets.QFormLayout(col_group)
+        base_dir_browse = QtWidgets.QPushButton("Browse...")
+        def browse_base_dir():
+            dir_path = QtWidgets.QFileDialog.getExistingDirectory(dlg, "Select Base Directory")
+            if dir_path:
+                base_dir_edit.setText(dir_path)
+        base_dir_browse.clicked.connect(browse_base_dir)
         
-        part_col = QtWidgets.QComboBox()
-        part_col.setEditable(True)
-        part_col.setCurrentText("Part Name")
-        
-        desc_col = QtWidgets.QComboBox()
-        desc_col.setEditable(True)
-        desc_col.setCurrentText("Description")
-        
-        qty_col = QtWidgets.QComboBox()
-        qty_col.setEditable(True)
-        qty_col.setCurrentText("Quantity")
-        
-        col_layout.addRow("Part Name Column:", part_col)
-        col_layout.addRow("Description Column:", desc_col)
-        col_layout.addRow("Quantity Column:", qty_col)
-        
-        options_layout.addRow("Excel Sheet:", sheet_combo)
-        options_layout.addRow(col_group)
-        
-        # Import to database option
-        import_to_db = QtWidgets.QCheckBox("Import directly to database")
-        import_to_db.setChecked(True)
-        import_to_db.setToolTip("Add parts to ModelFinder database for auto-suggestions")
-        options_layout.addRow(import_to_db)
-        
-        # Skip duplicates option
-        skip_dupes = QtWidgets.QCheckBox("Skip duplicate entries")
-        skip_dupes.setChecked(True)
-        options_layout.addRow(skip_dupes)
+        base_layout = QtWidgets.QHBoxLayout()
+        base_layout.addWidget(base_dir_edit)
+        base_layout.addWidget(base_dir_browse)
+        options_layout.addRow(base_dir_label, base_layout)
         
         layout.addWidget(options_group)
-        
-        # Preview area
-        preview_group = QtWidgets.QGroupBox("Preview (first 5 rows)")
-        preview_layout = QtWidgets.QVBoxLayout(preview_group)
-        
-        preview_table = QtWidgets.QTableWidget()
-        preview_table.setMaximumHeight(150)
-        preview_layout.addWidget(preview_table)
-        
-        layout.addWidget(preview_group)
-        
-        # Load Excel file and populate UI
-        try:
-            # Read Excel file
-            excel_file = pd.ExcelFile(file_path)
-            sheet_names = excel_file.sheet_names
-            sheet_combo.addItems(sheet_names)
-            
-            def update_preview():
-                """Update preview when sheet changes"""
-                sheet_name = sheet_combo.currentText()
-                if not sheet_name:
-                    return
-                
-                try:
-                    df = pd.read_excel(file_path, sheet_name=sheet_name, nrows=5)
-                    
-                    # Update column combos
-                    columns = df.columns.tolist()
-                    for combo in [part_col, desc_col, qty_col]:
-                        current = combo.currentText()
-                        combo.clear()
-                        combo.addItems(columns)
-                        if current in columns:
-                            combo.setCurrentText(current)
-                    
-                    # Update preview table
-                    preview_table.setRowCount(min(5, len(df)))
-                    preview_table.setColumnCount(len(columns))
-                    preview_table.setHorizontalHeaderLabels(columns)
-                    
-                    for row in range(min(5, len(df))):
-                        for col in range(len(columns)):
-                            value = str(df.iloc[row, col])
-                            preview_table.setItem(row, col, QtWidgets.QTableWidgetItem(value))
-                    
-                    preview_table.resizeColumnsToContents()
-                    
-                except Exception as e:
-                    print(f"Error updating preview: {e}")
-            
-            sheet_combo.currentTextChanged.connect(update_preview)
-            update_preview()  # Initial preview
-            
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(
-                dlg, "Read Error",
-                f"Could not read Excel file:\n{e}"
-            )
         
         # Buttons
         button_box = QtWidgets.QDialogButtonBox(
@@ -5150,95 +5051,165 @@ Built with PySide6 and modern UI design principles.
         if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         
-        # Process import
-        self._process_excel_import(
-            file_path,
-            {
-                'project_number': project_num.text().strip(),
-                'project_name': project_name.text().strip(),
-                'sheet_name': sheet_combo.currentText(),
-                'part_col': part_col.currentText(),
-                'desc_col': desc_col.currentText(),
-                'qty_col': qty_col.currentText(),
-                'import_to_db': import_to_db.isChecked(),
-                'skip_duplicates': skip_dupes.isChecked()
-            }
-        )
-
-    def _process_excel_import(self, file_path, options):
-        """Process the Excel import with the given options"""
         try:
-            import pandas as pd
+            # Determine base directory
+            base_dir = base_dir_edit.text().strip() or Path(file_path).parent
+            base_dir = Path(base_dir)
             
-            # Read the Excel file
-            df = pd.read_excel(file_path, sheet_name=options['sheet_name'])
+            # Get current project from filter if inference is enabled
+            current_project = None
+            if project_inference.isChecked():
+                # Try to get current project from the filter
+                current_project = self._get_current_project_from_filter()
             
-            if df.empty:
-                QtWidgets.QMessageBox.warning(self, APP_NAME, "The selected sheet is empty.")
-                return
+            # Use the new robust import system
+            rows, report = import_parts_from_excel(file_path, base_dir=base_dir)
             
-            # Extract relevant columns
-            parts = []
-            
-            for _, row in df.iterrows():
-                try:
-                    part_name = str(row[options['part_col']]).strip() if options['part_col'] in df.columns else ""
-                    description = str(row[options['desc_col']]).strip() if options['desc_col'] in df.columns else ""
-                    
-                    # Try to get quantity, default to 1
-                    quantity = 1
-                    if options['qty_col'] in df.columns:
-                        try:
-                            quantity = int(row[options['qty_col']])
-                        except (ValueError, TypeError):
-                            quantity = 1
-                    
-                    if part_name and part_name.lower() not in ['nan', 'none', '']:
-                        parts.append({
-                            'project_number': options['project_number'],
-                            'project_name': options['project_name'],
-                            'part_name': part_name,
-                            'description': description,
-                            'quantity': quantity,
-                            'original_label': part_name  # Keep original for reference
-                        })
-                except Exception as e:
-                    print(f"Error processing row: {e}")
-                    continue
-            
-            if not parts:
+            if not rows:
                 QtWidgets.QMessageBox.warning(
                     self, APP_NAME,
-                    "No valid parts found in the Excel file.\n"
-                    "Check that the column names are correct."
+                    "No valid parts found in the Excel file.\n\n"
+                    "Check that the file has 'name' and 'path' columns (or their variants)."
                 )
                 return
             
-            # Import to database if requested
-            if options['import_to_db']:
-                imported = self._import_parts_to_db(parts, options['skip_duplicates'])
-                
-                QtWidgets.QMessageBox.information(
-                    self, "Import Complete",
-                    f"Successfully imported {imported} parts from {len(parts)} total.\n\n"
-                    f"Project: {options['project_number']} - {options['project_name']}\n\n"
-                    "These parts will now be used for name proposals."
+            # Validate paths and apply project inference
+            validated_rows = self._validate_and_enhance_rows(rows, allow_missing.isChecked(), current_project)
+            
+            if not validated_rows:
+                QtWidgets.QMessageBox.warning(
+                    self, APP_NAME,
+                    "No valid parts found after path validation.\n\n"
+                    "Check that file paths exist or enable 'Allow missing files'."
                 )
-                
-                self.status.showMessage(f"Imported {imported} parts from Excel", 5000)
-            else:
-                # Just show what was found
-                QtWidgets.QMessageBox.information(
-                    self, "Excel Parsed",
-                    f"Found {len(parts)} parts in the Excel file.\n\n"
-                    f"Project: {options['project_number']} - {options['project_name']}"
-                )
+                return
+            
+            # Import to database
+            imported = self._import_parts_to_db_new(validated_rows)
+            
+            # Show rich summary with header mapping details
+            unknown_headers = report.get('unknown_headers', [])
+            mapped_headers = report.get('mapped', {})
+            missing_files = len(rows) - len(validated_rows)
+            
+            msg = (
+                f"✅ Imported {imported} parts from sheet '{report.get('sheet')}' "
+                f"using {report.get('engine')} engine.\n\n"
+                f"📊 Header Mapping:\n" +
+                "\n".join([f"  • {h} → {canon}" for h, canon in mapped_headers.items()]) +
+                (f"\n\n⚠️ Unknown headers: {', '.join(unknown_headers)}" if unknown_headers else "") +
+                (f"\n\n📝 Skipped {report.get('skipped', 0)} rows with missing required fields" if report.get('skipped', 0) > 0 else "") +
+                (f"\n\n🚫 {missing_files} parts skipped due to missing files" if missing_files > 0 else "")
+            )
+            
+            QtWidgets.QMessageBox.information(self, "Import Complete", msg)
+            self.status.showMessage(f"Imported {imported} parts from Excel", 5000)
             
         except Exception as e:
             QtWidgets.QMessageBox.critical(
                 self, "Import Failed",
                 f"Failed to import Excel file:\n{e}"
             )
+
+    def _import_parts_to_db_new(self, rows):
+        """Import ImportRow objects to the project_reference_parts table"""
+        imported = 0
+        
+        try:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            
+            for row in rows:
+                try:
+                    # Check if already exists (by name and path)
+                    cur.execute(
+                        """SELECT COUNT(*) FROM project_reference_parts 
+                        WHERE part_name=? AND original_label=?""",
+                        (row.name, row.name)
+                    )
+                    if cur.fetchone()[0] > 0:
+                        continue
+                    
+                    # Insert the part with new robust data
+                    cur.execute(
+                        """INSERT INTO project_reference_parts 
+                        (project_number, project_name, part_name, original_label, description, quantity, part_type, tags)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            row.project or "Unknown",
+                            row.project or "Unknown Project", 
+                            row.name,
+                            row.name,  # original_label
+                            "",  # description (not provided in new format)
+                            1,  # quantity (default)
+                            row.type or "",  # part_type
+                            row.tags or ""  # tags
+                        )
+                    )
+                    imported += 1
+                    
+                except Exception as e:
+                    print(f"Error importing row {row.name}: {e}")
+                    continue
+            
+            con.commit()
+            con.close()
+            
+        except Exception as e:
+            print(f"Database error during import: {e}")
+        
+        return imported
+
+    def _get_current_project_from_filter(self):
+        """Get the currently selected project from the filter UI"""
+        try:
+            # Try to get project from the project filter combo box
+            if hasattr(self, 'project_filter_combo') and self.project_filter_combo.currentText():
+                project_text = self.project_filter_combo.currentText()
+                # Extract project number from text like "300868 - Project Name"
+                import re
+                match = re.match(r'(\d+)', project_text)
+                if match:
+                    return match.group(1)
+            
+            # Try to get from the current folder filter
+            if hasattr(self, 'current_folder_filter') and self.current_folder_filter:
+                folder_name = Path(self.current_folder_filter).name
+                # Check if folder name starts with a project number
+                import re
+                match = re.match(r'(\d+)', folder_name)
+                if match:
+                    return match.group(1)
+            
+            return None
+        except Exception:
+            return None
+
+    def _validate_and_enhance_rows(self, rows, allow_missing=False, current_project=None):
+        """Validate file paths and enhance rows with project inference"""
+        validated_rows = []
+        
+        for row in rows:
+            # Check if file exists
+            if not allow_missing and not Path(row.path).exists():
+                continue
+            
+            # Apply project inference if no project specified
+            if not row.project and current_project:
+                # Create a new row with inferred project
+                from app.dataio.import_excel import ImportRow
+                enhanced_row = ImportRow(
+                    name=row.name,
+                    path=row.path,
+                    project=current_project,
+                    type=row.type,
+                    tags=row.tags
+                )
+                validated_rows.append(enhanced_row)
+            else:
+                validated_rows.append(row)
+        
+        return validated_rows
 
     def _import_parts_to_db(self, parts, skip_duplicates=True):
         """Import parts to the project_reference_parts table"""
