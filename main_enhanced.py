@@ -87,6 +87,19 @@ except ImportError as e:
     print(f"Warning: 3D viewer not available: {e}")
     _GL_VIEWER_AVAILABLE = False
 
+# GPU Preview Integration - Professional 3D Rendering
+try:
+    from preview_integration import integrate_with_main_window, GPU_AVAILABLE
+    
+    if GPU_AVAILABLE:
+        # Automatically add GPU preview dock to MainWindow
+        integrate_with_main_window(MainWindow)
+        print("✅ GPU preview rendering enabled! Professional 3D previews available.")
+    else:
+        print("ℹ️ GPU preview not available (install moderngl for professional rendering)")
+except ImportError as e:
+    print(f"ℹ️ Preview integration not loaded: {e}")
+
 # --- Similarity search (TF‑IDF + FAISS) imports ---
 try:
     import numpy as np
