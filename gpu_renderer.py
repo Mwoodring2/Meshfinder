@@ -20,6 +20,9 @@ try:
     MODERNGL_AVAILABLE = True
 except ImportError:
     MODERNGL_AVAILABLE = False
+    moderngl = None
+    trimesh = None
+    Image = None
     print("Warning: ModernGL not installed. GPU rendering disabled.")
     print("Install with: pip install moderngl trimesh pillow")
 
@@ -279,7 +282,7 @@ class GPURenderer:
             )
             self.msaa_fbo = None
     
-    def load_mesh(self, file_path: str) -> Optional[trimesh.Trimesh]:
+    def load_mesh(self, file_path: str):
         """
         Load a 3D mesh from file.
         
@@ -289,6 +292,9 @@ class GPURenderer:
         Returns:
             Trimesh object or None if loading fails
         """
+        if not MODERNGL_AVAILABLE or trimesh is None:
+            return None
+            
         # Check cache first
         if file_path in self.mesh_cache:
             return self.mesh_cache[file_path]
@@ -320,7 +326,7 @@ class GPURenderer:
             print(f"Failed to load mesh {file_path}: {e}")
             return None
     
-    def _prepare_mesh_data(self, mesh: trimesh.Trimesh) -> Tuple[np.ndarray, np.ndarray]:
+    def _prepare_mesh_data(self, mesh) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare mesh data for GPU upload.
         
@@ -339,7 +345,7 @@ class GPURenderer:
             mesh.vertices *= scale
         
         # Apply rotation if specified
-        if any(self.settings.rotation):
+        if any(self.settings.rotation) and trimesh is not None:
             rotation_matrix = trimesh.transformations.euler_matrix(
                 math.radians(self.settings.rotation[0]),
                 math.radians(self.settings.rotation[1]),
@@ -429,7 +435,7 @@ class GPURenderer:
         
         return mat
     
-    def render_to_image(self, mesh: trimesh.Trimesh) -> Image.Image:
+    def render_to_image(self, mesh) -> Image.Image:
         """
         Render a mesh to a PIL Image with GPU acceleration.
         
@@ -633,8 +639,8 @@ class HybridRenderer:
         if not self.use_gpu:
             # Import and initialize CPU renderer as fallback
             try:
-                from solid_renderer import SolidRenderer
-                self.cpu_renderer = SolidRenderer()
+                from solid_renderer import render_mesh_to_image as cpu_render
+                self.cpu_render = cpu_render
                 print("CPU rendering enabled (fallback)")
             except ImportError:
                 print("Warning: No CPU renderer available. Install dependencies.")
@@ -652,14 +658,16 @@ class HybridRenderer:
         """
         if self.use_gpu and self.gpu_renderer:
             return self.gpu_renderer.render_file(file_path, output_path)
-        elif self.cpu_renderer:
+        elif hasattr(self, 'cpu_render'):
             # CPU renderer fallback
-            mesh = self.cpu_renderer.load_stl(file_path)
-            if mesh:
-                return self.cpu_renderer.render_to_image(
-                    mesh,
-                    resolution=(self.settings.width, self.settings.height)
-                )
+            try:
+                image = self.cpu_render(file_path, size=(self.settings.width, self.settings.height))
+                if output_path and image:
+                    image.save(output_path)
+                return image
+            except Exception as e:
+                print(f"CPU render failed: {e}")
+                return None
         
         print("No renderer available")
         return None
@@ -668,10 +676,12 @@ class HybridRenderer:
         """Create a thumbnail of a 3D model"""
         if self.use_gpu and self.gpu_renderer:
             return self.gpu_renderer.create_thumbnail(file_path, size)
-        elif self.cpu_renderer:
-            mesh = self.cpu_renderer.load_stl(file_path)
-            if mesh:
-                return self.cpu_renderer.render_to_image(mesh, resolution=size)
+        elif hasattr(self, 'cpu_render'):
+            try:
+                return self.cpu_render(file_path, size=size)
+            except Exception as e:
+                print(f"CPU thumbnail failed: {e}")
+                return None
         return None
     
     def cleanup(self):
