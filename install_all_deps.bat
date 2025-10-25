@@ -34,6 +34,10 @@ echo 🎨 Installing GUI dependencies...
 python -m pip install PySide6 --prefer-binary
 
 echo.
+echo 🚀 Installing GPU-accelerated preview rendering...
+python -m pip install moderngl --prefer-binary
+
+echo.
 echo ✅ All dependencies installed successfully!
 echo.
 echo 🎉 ModelFinder is ready to use with:
@@ -41,5 +45,6 @@ echo    • 3D mesh processing (trimesh, numpy, pillow)
 echo    • Similarity search (faiss-cpu, scikit-learn)
 echo    • Excel import (pandas, openpyxl)
 echo    • GUI interface (PySide6)
+echo    • GPU-accelerated previews (moderngl)
 echo.
 pause

@@ -34,6 +34,10 @@ echo "🎨 Installing GUI dependencies..."
 pip install PySide6
 
 echo ""
+echo "🚀 Installing GPU-accelerated preview rendering..."
+pip install moderngl
+
+echo ""
 echo "✅ All dependencies installed successfully!"
 echo ""
 echo "🎉 ModelFinder is ready to use with:"
@@ -41,4 +45,5 @@ echo "   • 3D mesh processing (trimesh, numpy, pillow)"
 echo "   • Similarity search (faiss-cpu, scikit-learn)"
 echo "   • Excel import (pandas, openpyxl)"
 echo "   • GUI interface (PySide6)"
+echo "   • GPU-accelerated previews (moderngl)"
 echo ""

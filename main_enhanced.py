@@ -3382,43 +3382,78 @@ class MainWindow(QtWidgets.QMainWindow):
             self._display_thumbnail(cached)
             return
 
-        # 2) For 3D files, use preview_bridge for immediate generation with stats
+        # 2) For 3D files, use hybrid renderer for GPU-accelerated previews with CPU fallback
         if ext.lower() in ['.stl', '.obj', '.fbx', '.ply', '.glb']:
             self.preview_thumbnail.setText("Generating 3D preview...")
             
             try:
-                # Use preview_bridge for immediate, reliable preview generation
-                from preview_bridge import render_preview_qpixmap
+                # Use hybrid renderer for GPU-first previews with automatic fallback
+                from hybrid_preview_renderer import render_preview_auto
+                from PIL.ImageQt import ImageQt
+                from PySide6 import QtGui
                 
-                pix, stats = render_preview_qpixmap(file_path, size=(384, 384))
-                if pix:
+                # Pick face caps based on file size (keeps UI snappy)
+                size_mb = max(1, Path(file_path).stat().st_size // (1024*1024))
+                max_gpu = 150_000 if size_mb < 150 else 90_000
+                max_cpu = 120_000 if size_mb < 120 else 80_000
+                
+                # Generate preview with GPU-first approach (true z-buffering + MSAA)
+                img = render_preview_auto(file_path, size=(384,384),
+                                          max_faces_gpu=max_gpu, max_faces_cpu=max_cpu,
+                                          prefer_gpu=True)  # GPU-first
+                
+                # Convert to QPixmap
+                qimage = ImageQt(img)
+                pix = QtGui.QPixmap.fromImage(qimage)
+                
+                if not pix.isNull():
                     self.preview_thumbnail.setPixmap(pix.scaled(
                         self.preview_thumbnail.size() - QtCore.QSize(10, 10),
                         QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
                         QtCore.Qt.TransformationMode.SmoothTransformation
                     ))
                     
-                    # Update geometry info with reliable stats
-                    if stats.get('faces'):
-                        self.info_tris.setText(f"Tris: {stats['faces']:,}")
-                    if stats.get('extents'):
-                        dx, dy, dz = stats['extents']
-                        self.meta_dimensions.setText(f"{dx:.1f} × {dy:.1f} × {dz:.1f}")
-                    
                     # Cache the generated thumbnail
                     self.thumbnail_cache.save_thumbnail(file_path, pix)
                     return
                 else:
-                    # Show error message with notes
-                    notes = stats.get('notes', ['Unknown error'])
-                    self.preview_thumbnail.setText(f"Preview failed\n{'; '.join(notes[:2])}")
+                    self.preview_thumbnail.setText("Preview failed")
                     return
                     
             except ImportError:
-                # Fallback to background generation if preview_bridge not available
-                worker = ThumbnailGenWorker(file_path, self.thumbnail_cache, 256)
-                QtCore.QThreadPool.globalInstance().start(worker)
-                QtCore.QTimer.singleShot(2000, lambda: self._refresh_if_cache_ready(file_path))
+                # Fallback to preview_bridge if hybrid renderer not available
+                try:
+                    from preview_bridge import render_preview_qpixmap
+                    
+                    pix, stats = render_preview_qpixmap(file_path, size=(384, 384))
+                    if pix:
+                        self.preview_thumbnail.setPixmap(pix.scaled(
+                            self.preview_thumbnail.size() - QtCore.QSize(10, 10),
+                            QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
+                            QtCore.Qt.TransformationMode.SmoothTransformation
+                        ))
+                        
+                        # Update geometry info with reliable stats
+                        if stats.get('faces'):
+                            self.info_tris.setText(f"Tris: {stats['faces']:,}")
+                        if stats.get('extents'):
+                            dx, dy, dz = stats['extents']
+                            self.meta_dimensions.setText(f"{dx:.1f} × {dy:.1f} × {dz:.1f}")
+                        
+                        # Cache the generated thumbnail
+                        self.thumbnail_cache.save_thumbnail(file_path, pix)
+                        return
+                    else:
+                        # Show error message with notes
+                        notes = stats.get('notes', ['Unknown error'])
+                        self.preview_thumbnail.setText(f"Preview failed\n{'; '.join(notes[:2])}")
+                        return
+                        
+                except ImportError:
+                    # Final fallback to background generation
+                    worker = ThumbnailGenWorker(file_path, self.thumbnail_cache, 256)
+                    QtCore.QThreadPool.globalInstance().start(worker)
+                    QtCore.QTimer.singleShot(2000, lambda: self._refresh_if_cache_ready(file_path))
                 return
             except Exception as e:
                 self.preview_thumbnail.setText(f"Preview error\n{str(e)[:50]}")
@@ -3553,27 +3588,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Large preview is only available for 3D model files.")
                 return
             
-            # Generate large preview using solid_renderer
-            from solid_renderer import render_mesh_to_image
+            # Generate large preview using hybrid renderer
             from PIL.ImageQt import ImageQt
             
             self.status.showMessage("Generating large preview...", 3000)
             
-            # Use global face limit system for consistent performance
-            from solid_renderer import pick_max_faces
+            # Use hybrid renderer for GPU-accelerated large previews
+            from hybrid_preview_renderer import render_preview_auto
+            
             file_size_mb = Path(self.current_preview_file).stat().st_size / (1024 * 1024)
-            max_faces = pick_max_faces(file_size_mb)
+            max_gpu = 150_000 if file_size_mb < 150 else 90_000
+            max_cpu = 120_000 if file_size_mb < 120 else 80_000
             
-            self.status.showMessage(f"Large preview generated ({file_size_mb:.1f}MB, {max_faces:,} faces)", 3000)
+            self.status.showMessage(f"Large preview generated ({file_size_mb:.1f}MB, GPU-first)", 3000)
             
-            img = render_mesh_to_image(
+            # Generate with GPU-first approach (true z-buffering + MSAA for crisp results)
+            img = render_preview_auto(
                 file_path=self.current_preview_file,
                 size=(512, 512),
-                bg_rgba=(245, 245, 245, 255),  # Clean white background
-                face_rgb=(220, 220, 240),      # Light blue-gray for mesh
-                outline_rgb=(160, 160, 180),   # Subtle edge outlines
-                outline_width=1
-                # max_faces and draw_edges will be auto-determined by the renderer
+                max_faces_gpu=max_gpu,
+                max_faces_cpu=max_cpu,
+                prefer_gpu=True  # GPU-first for best quality
             )
             
             # Convert to QPixmap and display in a new window
@@ -3610,7 +3645,7 @@ class MainWindow(QtWidgets.QMainWindow):
             preview_window.show()
             # Show file size and face limit for large files
             if file_size_mb > 100:
-                self.status.showMessage(f"Large preview generated ({file_size_mb:.1f}MB, {max_faces} faces)", 3000)
+                self.status.showMessage(f"Large preview generated ({file_size_mb:.1f}MB, GPU-first)", 3000)
             else:
                 self.status.showMessage("Large preview generated", 2000)
             
