@@ -727,24 +727,37 @@ class GeometryWorker(QtCore.QRunnable):
         import trimesh
         
         try:
+            # Skip AppleDouble and other metadata files
+            if '.AppleDouble' in file_path or file_path.endswith('.DS_Store'):
+                return {"vertices": 0, "faces": 0, "extents": (0,0,0), "watertight": False, "error": "Metadata file"}
+            
             m = trimesh.load(file_path, force='mesh', process=False, maintain_order=True)
+            
+            # Handle None return (invalid files)
+            if m is None:
+                return {"vertices": 0, "faces": 0, "extents": (0,0,0), "watertight": False, "error": "Invalid file format"}
+            
             if isinstance(m, trimesh.Scene): 
                 m = trimesh.util.concatenate(m.dump())
             if isinstance(m, trimesh.points.PointCloud): 
                 m = m.convex_hull
             
+            # Ensure we have a valid mesh object
+            if not hasattr(m, 'vertices') or m.vertices is None:
+                return {"vertices": 0, "faces": 0, "extents": (0,0,0), "watertight": False, "error": "No geometry data"}
+            
             try: 
                 V = int(getattr(m, "vertices", np.empty((0,3))).shape[0])
             except Exception: 
-                V = None
+                V = 0
             try: 
                 F = int(getattr(m, "faces", np.empty((0,3))).shape[0])
             except Exception: 
-                F = None
+                F = 0
             try: 
                 ext = tuple(map(float, getattr(m, "extents", [0,0,0])))
             except Exception: 
-                ext = None
+                ext = (0,0,0)
             
             return {
                 "vertices": V, 
@@ -754,7 +767,7 @@ class GeometryWorker(QtCore.QRunnable):
             }
         except Exception as e:
             print(f"Safe mesh stats failed for {file_path}: {e}")
-            return {"vertices": None, "faces": None, "extents": None, "watertight": False}
+            return {"vertices": 0, "faces": 0, "extents": (0,0,0), "watertight": False, "error": str(e)}
 
 # -----------------------------
 # Dialog Classes
@@ -3340,24 +3353,37 @@ class MainWindow(QtWidgets.QMainWindow):
         import trimesh
         
         try:
+            # Skip AppleDouble and other metadata files
+            if '.AppleDouble' in file_path or file_path.endswith('.DS_Store'):
+                return {"vertices": 0, "faces": 0, "extents": (0,0,0), "watertight": False, "error": "Metadata file"}
+            
             m = trimesh.load(file_path, force='mesh', process=False, maintain_order=True)
+            
+            # Handle None return (invalid files)
+            if m is None:
+                return {"vertices": 0, "faces": 0, "extents": (0,0,0), "watertight": False, "error": "Invalid file format"}
+            
             if isinstance(m, trimesh.Scene): 
                 m = trimesh.util.concatenate(m.dump())
             if isinstance(m, trimesh.points.PointCloud): 
                 m = m.convex_hull
             
+            # Ensure we have a valid mesh object
+            if not hasattr(m, 'vertices') or m.vertices is None:
+                return {"vertices": 0, "faces": 0, "extents": (0,0,0), "watertight": False, "error": "No geometry data"}
+            
             try: 
                 V = int(getattr(m, "vertices", np.empty((0,3))).shape[0])
             except Exception: 
-                V = None
+                V = 0
             try: 
                 F = int(getattr(m, "faces", np.empty((0,3))).shape[0])
             except Exception: 
-                F = None
+                F = 0
             try: 
                 ext = tuple(map(float, getattr(m, "extents", [0,0,0])))
             except Exception: 
-                ext = None
+                ext = (0,0,0)
             
             return {
                 "vertices": V, 
@@ -3367,7 +3393,7 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         except Exception as e:
             print(f"Safe mesh stats failed for {file_path}: {e}")
-            return {"vertices": None, "faces": None, "extents": None, "watertight": False}
+            return {"vertices": 0, "faces": 0, "extents": (0,0,0), "watertight": False, "error": str(e)}
     
     def _load_thumbnail(self, file_path: str, name: str, ext: str):
         """Load thumbnail for the given file"""
