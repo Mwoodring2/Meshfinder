@@ -60,7 +60,7 @@ def _gpu_render(file_path: str | Path,
                 size: Tuple[int,int] = (512,512),
                 max_faces: int = 150_000,
                 msaa_samples: int = 4,
-                bg_rgba = (24,24,28,0)) -> Image.Image:
+                bg_rgba = (18,18,22,0)) -> Image.Image:
     """
     GPU path: ModernGL offscreen framebuffer, flat shaded tris with z-buffer + MSAA.
     Returns Pillow Image. Raises on any GPU failure.
@@ -100,18 +100,41 @@ def _gpu_render(file_path: str | Path,
     scale = 1.8 / span  # leave ~10% border
     verts_ndc = (verts_iso - mins[None,:]) * scale - 0.9
 
-    # Flat normals per triangle
-    tri = verts_ndc[mesh.faces]                  # (F,3,3)
-    n = np.cross(tri[:,1]-tri[:,0], tri[:,2]-tri[:,0]).astype(np.float32)
-    n /= (np.linalg.norm(n, axis=1, keepdims=True) + 1e-9)
+    # ---- SMOOTH SHADING (Windows preset) ----
+    # ensure vertex normals
+    try:
+        if not hasattr(mesh, "vertex_normals") or mesh.vertex_normals is None \
+           or len(mesh.vertex_normals) != len(mesh.vertices):
+            mesh.fix_normals()  # computes per-vertex normals
+    except Exception:
+        pass
 
-    # Expand to non-indexed buffer (positions + normals per-vertex) for flat shading
-    pos = tri.reshape(-1, 3)                     # (F*3, 3)
-    nor = np.repeat(n, 3, axis=0)                # (F*3, 3)
-    vbo_data = np.hstack([pos, nor]).astype('f4').tobytes()
+    positions = verts_ndc.astype('f4', copy=False)
+    normals   = getattr(mesh, "vertex_normals", None)
+    if normals is None or len(normals) != len(positions):
+        # fallback: use face normals expanded (still looks ok)
+        tri = verts_ndc[mesh.faces]
+        fn  = np.cross(tri[:,1]-tri[:,0], tri[:,2]-tri[:,0]).astype('f4')
+        fn /= (np.linalg.norm(fn, axis=1, keepdims=True) + 1e-9)
+        positions = tri.reshape(-1,3).astype('f4')
+        normals   = np.repeat(fn, 3, axis=0).astype('f4')
+        indices   = None
+    else:
+        indices = mesh.faces.astype('i4', copy=False).ravel()
 
-    # Shaders (clip-space in, lambert shading, gamma-correct)
-    vs = """
+    # Context + FBO with improved MSAA
+    ctx = moderngl.create_standalone_context(require=330)
+    samples = 8 if msaa_samples >= 8 else 4
+    fbo = ctx.simple_framebuffer((W, H), components=4, samples=samples)
+    fbo.use()
+    ctx.viewport = (0, 0, W, H)
+    ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+    ctx.front_face = 'ccw'
+    ctx.cull_face  = 'back'
+    fbo.clear(bg_rgba[0]/255.0, bg_rgba[1]/255.0, bg_rgba[2]/255.0, bg_rgba[3]/255.0)
+
+    # build buffers / vao
+    prog = ctx.program(vertex_shader="""
         #version 330
         in vec3 in_pos;
         in vec3 in_nrm;
@@ -120,45 +143,17 @@ def _gpu_render(file_path: str | Path,
             gl_Position = vec4(in_pos, 1.0);
             v_nrm = normalize(in_nrm);
         }
-    """
-    fs = """
-        #version 330
-        in vec3 v_nrm;
-        out vec4 f_color;
-        uniform vec3 u_light = vec3(0.577, 0.577, 0.577);
-        uniform vec3 u_base  = vec3(0.862, 0.862, 0.941);  // 220/255
-        uniform float u_ambient = 0.20;
-        void main() {
-            float ndl = max(dot(normalize(v_nrm), normalize(u_light)), 0.0);
-            float shade = clamp(u_ambient + (1.0 - u_ambient) * ndl, u_ambient, 1.0);
-            vec3 rgb = u_base * shade;
-            // simple gamma to look closer to Explorer
-            rgb = pow(rgb, vec3(1.0/2.2));
-            f_color = vec4(rgb, 1.0);
-        }
-    """
+    """, fragment_shader=fs)
 
-    # Context + FBO
-    ctx = moderngl.create_standalone_context(require=330)
-    samples = msaa_samples if msaa_samples in (0, 2, 4, 8, 16) else 4
-    fbo = ctx.simple_framebuffer((W, H), components=4, samples=samples)
-    fbo.use()
-    ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
-    ctx.front_face = 'ccw'
-    ctx.cull_face = 'back'
+    if indices is not None:
+        vbo = ctx.buffer(np.hstack([positions, normals]).astype('f4').tobytes())
+        ibo = ctx.buffer(indices.tobytes())
+        vao = ctx.vertex_array(prog, [(vbo, '3f 3f', 'in_pos', 'in_nrm')], index_buffer=ibo)
+    else:
+        vbo = ctx.buffer(np.hstack([positions, normals]).astype('f4').tobytes())
+        vao = ctx.vertex_array(prog, [(vbo, '3f 3f', 'in_pos', 'in_nrm')])
 
-    # Clear background
-    fbo.clear(bg_rgba[0]/255.0, bg_rgba[1]/255.0, bg_rgba[2]/255.0, bg_rgba[3]/255.0)
-
-    # Program + VAO
-    prog = ctx.program(vertex_shader=vs, fragment_shader=fs)
-    vbo = ctx.buffer(vbo_data)
-    vao = ctx.vertex_array(
-        prog,
-        [(vbo, '3f 3f', 'in_pos', 'in_nrm')],
-    )
-
-    # Draw (non-indexed triangles)
+    # Draw (indexed or non-indexed triangles)
     vao.render(moderngl.TRIANGLES)
 
     # Resolve MSAA and read pixels
