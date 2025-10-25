@@ -435,7 +435,7 @@ class GPURenderer:
         
         return mat
     
-    def render_to_image(self, mesh) -> Image.Image:
+    def render_to_image(self, mesh):
         """
         Render a mesh to a PIL Image with GPU acceleration.
         
@@ -535,7 +535,11 @@ class GPURenderer:
         image_data = np.flipud(image_data)
         
         # Create PIL Image (RGBA)
-        image = Image.fromarray(image_data, mode='RGBA')
+        if Image is not None:
+            image = Image.fromarray(image_data, mode='RGBA')
+        else:
+            # Fallback if PIL not available
+            return None
         
         # Clean up
         vao.release()
@@ -543,7 +547,7 @@ class GPURenderer:
         
         return image
     
-    def render_file(self, file_path: str, output_path: Optional[str] = None) -> Optional[Image.Image]:
+    def render_file(self, file_path: str, output_path: Optional[str] = None):
         """
         Render a 3D model file to an image.
         
@@ -569,7 +573,7 @@ class GPURenderer:
         
         return image
     
-    def create_thumbnail(self, file_path: str, size: Tuple[int, int] = (256, 256)) -> Optional[Image.Image]:
+    def create_thumbnail(self, file_path: str, size: Tuple[int, int] = (256, 256)) :
         """
         Create a thumbnail preview of a 3D model.
         
@@ -645,7 +649,7 @@ class HybridRenderer:
             except ImportError:
                 print("Warning: No CPU renderer available. Install dependencies.")
     
-    def render_file(self, file_path: str, output_path: Optional[str] = None) -> Optional[Image.Image]:
+    def render_file(self, file_path: str, output_path: Optional[str] = None) :
         """
         Render a 3D model using the best available method.
         
@@ -672,7 +676,7 @@ class HybridRenderer:
         print("No renderer available")
         return None
     
-    def create_thumbnail(self, file_path: str, size: Tuple[int, int] = (256, 256)) -> Optional[Image.Image]:
+    def create_thumbnail(self, file_path: str, size: Tuple[int, int] = (256, 256)) :
         """Create a thumbnail of a 3D model"""
         if self.use_gpu and self.gpu_renderer:
             return self.gpu_renderer.create_thumbnail(file_path, size)

@@ -90,14 +90,9 @@ except ImportError as e:
 # GPU Preview Integration - Professional 3D Rendering
 try:
     from preview_integration import integrate_with_main_window, GPU_AVAILABLE
-    
-    if GPU_AVAILABLE:
-        # Automatically add GPU preview dock to MainWindow
-        integrate_with_main_window(MainWindow)
-        print("✅ GPU preview rendering enabled! Professional 3D previews available.")
-    else:
-        print("ℹ️ GPU preview not available (install moderngl for professional rendering)")
+    _GPU_INTEGRATION_AVAILABLE = True
 except ImportError as e:
+    _GPU_INTEGRATION_AVAILABLE = False
     print(f"ℹ️ Preview integration not loaded: {e}")
 
 # --- Similarity search (TF‑IDF + FAISS) imports ---
@@ -5488,6 +5483,16 @@ def main():
     window.show()
     
     sys.exit(app.exec())
+
+# GPU Integration - Apply after MainWindow class is defined
+if _GPU_INTEGRATION_AVAILABLE and GPU_AVAILABLE:
+    try:
+        integrate_with_main_window(MainWindow)
+        print("GPU preview rendering enabled! Professional 3D previews available.")
+    except Exception as e:
+        print(f"GPU integration failed: {e}")
+elif _GPU_INTEGRATION_AVAILABLE:
+    print("GPU preview not available (install moderngl for professional rendering)")
 
 if __name__ == "__main__":
     main()
